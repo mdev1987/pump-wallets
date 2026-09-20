@@ -1,0 +1,19 @@
+{
+  "name": "solana-pump-wallet-research-integrated",
+  "version": "11.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "bun run get_pump_wallets.ts",
+    "check": "tsc --noEmit",
+    "help": "bun run get_pump_wallets.ts --help"
+  },
+  "dependencies": {
+    "@duckdb/node-api": "^1.5.5-r.5"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/node": "latest",
+    "typescript": "latest"
+  }
+}

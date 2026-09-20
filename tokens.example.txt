@@ -1,0 +1,3 @@
+# One Solana token mint per line.
+# You can pass this file with --tokens-file ./tokens.txt
+viBEsohKdeaUgNhbB1j4NpsAm4Bg8LCCwYhkpb6UyNN
