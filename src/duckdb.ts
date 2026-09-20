@@ -470,6 +470,9 @@ export class ResearchDb {
       ALTER TABLE wallet_token_summary ADD COLUMN IF NOT EXISTS predictive_qualified BOOLEAN DEFAULT FALSE;
       ALTER TABLE debot_signals ADD COLUMN IF NOT EXISTS liquidity_bucket VARCHAR;
       ALTER TABLE debot_signals ADD COLUMN IF NOT EXISTS market_cap_bucket VARCHAR;
+      ALTER TABLE wallet_pump_observations ADD COLUMN IF NOT EXISTS entry_evidence_score DOUBLE DEFAULT 0;
+      ALTER TABLE wallet_token_summary ADD COLUMN IF NOT EXISTS entry_evidence_score DOUBLE DEFAULT 0;
+      ALTER TABLE pump_buy_events ADD COLUMN IF NOT EXISTS entry_evidence_score DOUBLE DEFAULT 0;
     `);
   }
 
@@ -695,6 +698,7 @@ export class ResearchDb {
       row.excessForward5Median ?? null, row.excessForward15Median ?? null, row.excessForward30Median ?? null, row.excessForward60Median ?? null,
       row.positive15Lift ?? null, row.positive30Lift ?? null, row.positive60Lift ?? null,
       runId,
+      row.entryEvidenceScore,
     ]);
   }
 
@@ -706,6 +710,7 @@ export class ResearchDb {
       row.forward15 ?? null, row.forward30 ?? null, row.forward60 ?? null, row.maxForward15 ?? null, row.maxForward30 ?? null,
       row.leadEvidenceScore,
       runId,
+      row.entryEvidenceScore,
     ]);
   }
 
@@ -736,6 +741,7 @@ export class ResearchDb {
       runId,
       row.controlBackedPumps,
       row.predictiveQualified,
+      row.entryEvidenceScore,
     ]);
   }
 

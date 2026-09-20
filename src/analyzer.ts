@@ -112,8 +112,13 @@ export type BuyAttribution = {
   trade: Trade;
   leadPumpId: number | null;
   secondsFromPumpStart: number | null;
+  /** Share of pump-window buys visible at the trade timestamp (prospective). */
   pumpBuyFlowShare: number | null;
+  /** Share of local-window buys visible at the trade timestamp (prospective). */
   localBuyFlowShare: number | null;
+  /** Full-window shares (retrospective forensics; include future buys). */
+  fullPumpBuyFlowShare: number | null;
+  fullLocalBuyFlowShare: number | null;
   forward1: number | null;
   forward3: number | null;
   forward5: number | null;
@@ -123,12 +128,18 @@ export type BuyAttribution = {
   forward60: number | null;
   maxForward15: number | null;
   maxForward30: number | null;
+  /** Entry-time feature score. Uses only information available by the buy timestamp. */
+  entryEvidenceScore: number;
+  /** Retrospective score. May use future forward returns and is never used for prospective ranking. */
   leadEvidenceScore: number;
 };
 
 export type WalletLeader = {
   rank: number;
   wallet: string;
+  /** Prospective score using entry-time information only. */
+  entryEvidenceScore: number;
+  /** Retrospective outcome-aware score; descriptive only. */
   leadEvidenceScore: number;
   pumpsLed: number;
   pumpCount: number;
@@ -137,8 +148,8 @@ export type WalletLeader = {
   /** Pumps with a sufficient (uncontaminated, large-enough) control baseline. */
   controlBackedPumps: number;
   /**
-   * ML-ready flag: at least one pre-pump pump AND at least one
-   * control-sufficient pump. Observations without controls stay in the
+   * ML-ready flag: repeated (2+) pre-pump pumps AND repeated (2+)
+   * control-sufficient pumps. Observations without controls stay in the
    * dataset for forensics but must not train a predictive score.
    */
   predictiveQualified: boolean;
@@ -237,6 +248,7 @@ export type PumpBuyEventOutput = {
   forward60: number | null;
   maxForward15: number | null;
   maxForward30: number | null;
+  entryEvidenceScore: number;
   leadEvidenceScore: number;
 };
 
@@ -303,6 +315,7 @@ export type WalletPumpObservation = {
   positive15Rate: number | null;
   positive30Rate: number | null;
   positive60Rate: number | null;
+  entryEvidenceScore: number;
   leadEvidenceScore: number;
   controlBuyCount: number;
   controlBuySol: number;
@@ -1285,14 +1298,17 @@ function clampResponse(value: number | null): number {
   return clamp(value / CONFIG.leaderResponseScale, -1, 3);
 }
 
-function computeLeadEvidenceScore(
+/**
+ * Entry-time evidence: timing, size and buy-flow shares computed ONLY from
+ * buys visible at or before the trade timestamp. No forward returns, no
+ * full-window totals. This is the only score allowed into prospective
+ * wallet ranking; everything outcome-derived is a label, not a feature.
+ */
+function computeEntryEvidenceScore(
   trade: Trade,
   secondsFromPumpStart: number | null,
-  pumpBuyFlowShare: number | null,
-  localBuyFlowShare: number | null,
-  forward5: number | null,
-  forward15: number | null,
-  forward30: number | null,
+  pumpBuyFlowShareAtEntry: number | null,
+  localBuyFlowShareAtEntry: number | null,
 ): number {
   if (
     trade.type !== 'buy' ||
@@ -1308,15 +1324,25 @@ function computeLeadEvidenceScore(
   // Keep size important, but sub-linear, so a single 100+ SOL trade cannot
   // completely dominate several smaller but repeatedly well-timed buys.
   const sizeWeight = Math.sqrt(trade.solAmount);
-  const flowWeight = 0.5 + 2 * clamp(pumpBuyFlowShare ?? 0, 0, 1);
-  const localFlowWeight = 0.5 + clamp(localBuyFlowShare ?? 0, 0, 1);
+  const flowWeight = 0.5 + 2 * clamp(pumpBuyFlowShareAtEntry ?? 0, 0, 1);
+  const localFlowWeight = 0.5 + clamp(localBuyFlowShareAtEntry ?? 0, 0, 1);
+  return timing * sizeWeight * flowWeight * localFlowWeight;
+}
+
+/** Retrospective descriptive score. Uses future forward returns: never use this as an entry-time feature or ranking input. */
+function computeLeadEvidenceScore(
+  entryEvidenceScore: number,
+  forward5: number | null,
+  forward15: number | null,
+  forward30: number | null,
+): number {
+  if (entryEvidenceScore <= 0) return 0;
   const response =
     1 +
     0.25 * clampResponse(forward5) +
     0.35 * clampResponse(forward15) +
     0.40 * clampResponse(forward30);
-
-  return timing * sizeWeight * flowWeight * localFlowWeight * Math.max(0.25, response);
+  return entryEvidenceScore * Math.max(0.25, response);
 }
 
 function buildBuyAttributions(
@@ -1340,18 +1366,45 @@ function buildBuyAttributions(
     .filter((trade) => trade.type === 'buy')
     .map((trade) => {
       const nearest = nearestPumpForBuy(trade.timestamp, pumpWindows);
-      const pumpTotal = nearest ? pumpBuyFlow.get(nearest.pump.id) ?? 0 : 0;
-      const localTotal = sumBuySolInWindow(
+      // Full-window totals are retrospective forensics (they include buys
+      // that happened AFTER this trade). Entry-time shares below use only
+      // information available at the trade timestamp.
+      const pumpTotalFull = nearest ? pumpBuyFlow.get(nearest.pump.id) ?? 0 : 0;
+      const localTotalAtEntry = sumBuySolInWindow(
+        flowIndex,
+        trade.timestamp - CONFIG.leadFlowWindowSec,
+        trade.timestamp,
+      );
+      const localTotalFull = sumBuySolInWindow(
         flowIndex,
         trade.timestamp - CONFIG.leadFlowWindowSec,
         trade.timestamp + CONFIG.leadFlowWindowSec,
       );
-      const pumpShare = pumpTotal > 0 && nearest
-        ? trade.solAmount / pumpTotal
+      const pumpTotalAtEntry = nearest
+        ? sumBuySolInWindow(
+            flowIndex,
+            nearest.pump.startTimestamp - CONFIG.prePumpSec,
+            Math.min(trade.timestamp, nearest.pump.startTimestamp + CONFIG.earlyPumpSec),
+          )
+        : 0;
+      const pumpShareAtEntry = pumpTotalAtEntry > 0 && nearest
+        ? trade.solAmount / pumpTotalAtEntry
         : null;
-      const localShare = localTotal > 0
-        ? trade.solAmount / localTotal
+      const pumpShareFull = pumpTotalFull > 0 && nearest
+        ? trade.solAmount / pumpTotalFull
         : null;
+      const localShareAtEntry = localTotalAtEntry > 0
+        ? trade.solAmount / localTotalAtEntry
+        : null;
+      const localShareFull = localTotalFull > 0
+        ? trade.solAmount / localTotalFull
+        : null;
+      const entryEvidenceScore = computeEntryEvidenceScore(
+        trade,
+        nearest?.deltaSec ?? null,
+        pumpShareAtEntry,
+        localShareAtEntry,
+      );
 
       const forward1 = forwardReturnFromTrade(trade, buckets, CONFIG.forward1Sec);
       const forward3 = forwardReturnFromTrade(trade, buckets, CONFIG.forward3Sec);
@@ -1367,8 +1420,10 @@ function buildBuyAttributions(
         trade,
         leadPumpId: nearest?.pump.id ?? null,
         secondsFromPumpStart: nearest?.deltaSec ?? null,
-        pumpBuyFlowShare: pumpShare,
-        localBuyFlowShare: localShare,
+        pumpBuyFlowShare: pumpShareAtEntry,
+        localBuyFlowShare: localShareAtEntry,
+        fullPumpBuyFlowShare: pumpShareFull,
+        fullLocalBuyFlowShare: localShareFull,
         forward1,
         forward3,
         forward5,
@@ -1378,11 +1433,9 @@ function buildBuyAttributions(
         forward60,
         maxForward15: max15,
         maxForward30: max30,
+        entryEvidenceScore,
         leadEvidenceScore: computeLeadEvidenceScore(
-          trade,
-          nearest?.deltaSec ?? null,
-          pumpShare,
-          localShare,
+          entryEvidenceScore,
           forward5,
           forward15,
           forward30,
@@ -1505,7 +1558,7 @@ function buildWalletPumpObservations(
   );
 
   for (const item of attributions) {
-    if (item.leadPumpId === null || item.leadEvidenceScore <= 0) continue;
+    if (item.leadPumpId === null || item.entryEvidenceScore <= 0) continue;
     if (distributionPumpIds.has(item.leadPumpId)) continue;
     if (item.trade.solAmount < CONFIG.minLeaderTradeSol) continue;
     if (item.secondsFromPumpStart === null || item.secondsFromPumpStart >= CONFIG.earlyPumpSec) continue;
@@ -1633,6 +1686,7 @@ function buildWalletPumpObservations(
       positive15Rate: positive15,
       positive30Rate: positive30,
       positive60Rate: positive60,
+      entryEvidenceScore: items.reduce((sum, item) => sum + item.entryEvidenceScore, 0),
       leadEvidenceScore: items.reduce((sum, item) => sum + item.leadEvidenceScore, 0),
       controlBuyCount: control.buyCount,
       controlBuySol: control.buySol,
@@ -1717,7 +1771,7 @@ function summarizeWallets(
       item.leadPumpId !== null &&
       item.secondsFromPumpStart !== null &&
       item.secondsFromPumpStart < 0 &&
-      item.leadEvidenceScore > 0
+      item.entryEvidenceScore > 0
     ) {
       const existing = prePumpAttributionsByWallet.get(item.trade.wallet);
       if (existing) existing.push(item);
@@ -1802,6 +1856,10 @@ function summarizeWallets(
         (pumpObservations.length + CONFIG.reliabilityPriorPumps)
       : null;
 
+    const totalEntryEvidenceScore = pumpObservations.reduce(
+      (sum, item) => sum + item.entryEvidenceScore,
+      0,
+    );
     const totalLeadEvidenceScore = pumpObservations.reduce(
       (sum, item) => sum + item.leadEvidenceScore,
       0,
@@ -1858,7 +1916,10 @@ function summarizeWallets(
         : null;
 
     const controlBackedPumps = pumpObservations.filter((item) => item.controlSufficient).length;
-    const predictiveQualified = prePumpPumps >= 1 && controlBackedPumps >= 1;
+    // Token-local research qualification: repeated pre-pump evidence plus
+    // repeated control-sufficient evidence within this token. Cross-token
+    // repetition is evaluated separately in wallet_global_summary.
+    const predictiveQualified = prePumpPumps >= 2 && controlBackedPumps >= 2;
     const totalPrePumpBuySol = pumpObservations.reduce((sum, item) => sum + item.prePumpBuySol, 0);
     const dustFlag = totalPrePumpBuySol < 0.5 ? `dust pre-pump ${totalPrePumpBuySol.toFixed(3)} SOL` : `pre-pump ${totalPrePumpBuySol.toFixed(2)} SOL`;
     const medianLeadFlag = medianLeadSec === null
@@ -1877,8 +1938,8 @@ function summarizeWallets(
         ? `control-backed on ${controlBackedPumps}/${pumpObservations.length} pumps`
         : 'control baseline sufficient',
       predictiveQualified
-        ? 'predictive-qualified (pre-pump + control-backed evidence)'
-        : 'observational only (no joint pre-pump + control-backed evidence)',
+        ? 'predictive-qualified (repeated pre-pump + repeated control-backed evidence)'
+        : 'observational only (needs repeated pre-pump + repeated control-backed evidence)',
       controlPositive30Lift === null
         ? 'control 30s positive-rate lift n/a'
         : `median 30s positive-rate lift ${(controlPositive30Lift * 100).toFixed(1)}pp`,
@@ -1892,6 +1953,7 @@ function summarizeWallets(
 
     leaders.push({
       wallet,
+      entryEvidenceScore: totalEntryEvidenceScore,
       leadEvidenceScore: totalLeadEvidenceScore,
       pumpsLed: pumpObservations.length,
       pumpCount: pumpObservations.length,
@@ -1995,30 +2057,20 @@ function summarizeWallets(
     });
   }
 
-  // Rank true pre-pump repeatability first: pumps WITH pre-pump buys, then
-  // CONTROL-BACKED pumps (observational-only evidence must not outrank
-  // counterfactual-backed evidence), then total pumps, control-adjusted edge,
-  // per-pump evidence (size+timing aware) and pre-pump SOL.
+  // Prospective/event-conditioned ranking only. Future outcome metrics
+  // (reliability-adjusted excess, positive lifts, forward-based scores) are
+  // labels for post-hoc evaluation, never ranking inputs — ranking on them
+  // would leak future price action into a supposedly predictive order.
+  // Positive pre-pump count is the primary recurrence signal.
   leaders.sort(
     (a, b) =>
       b.prePumpPumps - a.prePumpPumps ||
       b.controlBackedPumps - a.controlBackedPumps ||
-      b.pumpsLed - a.pumpsLed ||
-      (b.reliabilityAdjustedExcessForward30Median ?? -Infinity) -
-        (a.reliabilityAdjustedExcessForward30Median ?? -Infinity) ||
-      (b.meanLeadEvidenceScorePerPump ?? -Infinity) -
-        (a.meanLeadEvidenceScorePerPump ?? -Infinity) ||
+      b.entryEvidenceScore - a.entryEvidenceScore ||
       b.prePumpBuySol - a.prePumpBuySol ||
-      b.independentPumpCoverage - a.independentPumpCoverage ||
-      (b.reliabilityAdjusted30PumpRate ?? -Infinity) -
-        (a.reliabilityAdjusted30PumpRate ?? -Infinity) ||
-      (b.controlAdjustedForward30Median ?? -Infinity) -
-        (a.controlAdjustedForward30Median ?? -Infinity) ||
-      (b.controlPositive30Lift ?? -Infinity) -
-        (a.controlPositive30Lift ?? -Infinity) ||
-      b.leadEvidenceScore - a.leadEvidenceScore ||
       (b.medianSecondsBeforePump ?? Number.NEGATIVE_INFINITY) -
         (a.medianSecondsBeforePump ?? Number.NEGATIVE_INFINITY) ||
+      b.pumpsLed - a.pumpsLed ||
       a.wallet.localeCompare(b.wallet),
   );
 
@@ -2162,7 +2214,7 @@ export function analyzeToken(
       description:
         'Historical scanning first uses signatures-only activity discovery to select the busiest short activity windows plus a small set of lower-activity pre-spike reconnaissance windows, then fetches full Helius transaction payloads only for the union of those ranges. Overlapping ranges are merged before splitting, and dense unions are recursively split using already-collected fine activity counts; there is no arbitrary first-N-page truncation. The primary research unit is wallet × independent pump window. Wallet evidence combines pre-pump timing, repeated leadership across independent windows, local/pump-window buy-flow share, forward price response from each buy execution, and a nearby non-leading-buy control baseline.',
       note:
-        'These are temporal/market-association signals, not proof that a wallet caused the pump or had causal price impact. Control baselines use same-token buys sufficiently before the pre-pump window and outside other detected pump contexts; when many controls exist, they are deterministically thinned across the control interval. Excess response is descriptive, not causal.',
+        'These are temporal/market-association signals, not proof that a wallet caused the pump or had causal price impact. Control baselines use same-token buys sufficiently before the pre-pump window and outside other detected pump contexts; when many controls exist, they are deterministically thinned across the control interval. Excess response is descriptive, not causal. Wallet ranking uses entry-time evidence only (timing, size, at-entry flow shares); forward and control-adjusted outcomes are stored as evaluation labels, never ranking inputs.',
       unitOfAnalysis: 'wallet × independent pump window',
       forwardHorizonsSec: [
         config.forward1Sec,
@@ -2189,7 +2241,7 @@ export function analyzeToken(
     // perform cross-token research without silently dropping lower-ranked rows.
     walletLeaders: leaders,
     pumpBuyEvents: attributions
-      .filter((item) => item.leadPumpId !== null && item.leadEvidenceScore > 0)
+      .filter((item) => item.leadPumpId !== null && item.entryEvidenceScore > 0)
       .sort(
         (a, b) =>
           b.leadEvidenceScore - a.leadEvidenceScore ||
@@ -2221,6 +2273,7 @@ export function analyzeToken(
           forward60: item.forward60,
           maxForward15: item.maxForward15,
           maxForward30: item.maxForward30,
+          entryEvidenceScore: item.entryEvidenceScore,
           leadEvidenceScore: item.leadEvidenceScore,
         } satisfies PumpBuyEventOutput;
       })

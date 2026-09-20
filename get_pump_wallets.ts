@@ -349,7 +349,9 @@ async function main(): Promise<void> {
     let debotSnapshot: DeBotTrendingSnapshot | null = null;
     let debotCandidates: DeBotTrendingSignal[] = [];
 
-    if (config.debotEnabled) {
+    // Explicit --token scans never spend DeBot discovery requests: the token
+    // set is already known, so the 1m/5m/heatmap fetch is pure overhead.
+    if (config.debotEnabled && cliTokens.length === 0) {
       try {
         const discovered = await discoverWithDeBot(config, rootLogger);
         debotSnapshot = discovered.snapshot;
@@ -359,6 +361,8 @@ async function main(): Promise<void> {
         await rootLogger.error('DeBot discovery or DuckDB persistence failed; continuing with explicit CLI tokens', error);
         if (config.debotScanCandidates && cliTokens.length === 0) throw error;
       }
+    } else if (cliTokens.length > 0) {
+      await rootLogger.info(`DeBot discovery skipped: ${cliTokens.length} explicit CLI token(s) provided`);
     }
 
     const sources = new Map<string, TokenSource>();
