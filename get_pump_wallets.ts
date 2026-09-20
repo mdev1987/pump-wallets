@@ -9,6 +9,7 @@ import { exportGlobalCsv, persistToken, recordTokenFailure, ResearchDb, type Tok
 import { fetchTransactions } from './src/helius';
 import { Logger } from './src/logger';
 import { objectsToCsv } from './src/csv';
+import { shouldSkipRescan } from './src/rescan';
 import {
   DeBotClient,
   type DeBotTrendingSignal,
@@ -404,13 +405,30 @@ async function main(): Promise<void> {
     // discarded immediately, and only the compact Trade[] survives. This keeps
     // peak RAM bounded by one token instead of N concurrent full histories.
     let success = 0;
+    let skipped = 0;
     for (const [index, token] of tokens.entries()) {
       const logger = rootLogger.child(token);
       console.log(`\n[${index + 1}/${tokens.length}] Analyzing ${token}`);
+      const source = sources.get(token)!;
+      // Fresh-artifact skip applies to DeBot discovery only; explicit CLI
+      // tokens are always (re)scanned on request.
+      if (source === 'debot') {
+        try {
+          const raw = await readFile(`${tokenDir(config, token)}/response.json`, 'utf8');
+          if (shouldSkipRescan(JSON.parse(raw), Date.now(), config.rescanSkipSec)) {
+            skipped += 1;
+            const msg = `Token ${token}: skipping fresh artifact (<${config.rescanSkipSec}s old) | source=debot`;
+            await rootLogger.info(msg);
+            console.log(msg);
+            continue;
+          }
+        } catch {
+          // Missing/unparseable artifact: fall through to a full scan.
+        }
+      }
       const tokenScanStartedAt = new Date().toISOString();
       try {
         const debotSignal = debotSnapshot?.signals.find((signal) => signal.address === token) ?? null;
-        const source = sources.get(token)!;
         const result = await analyzeOne(
           config,
           token,
@@ -477,7 +495,7 @@ async function main(): Promise<void> {
     }
 
     await exportGlobalViews(db, config);
-    await rootLogger.info(`Finished: ${success}/${tokens.length} token(s) persisted successfully`);
+    await rootLogger.info(`Finished: ${success}/${tokens.length} token(s) persisted successfully (skipped ${skipped} fresh)`);
 
     console.log(`\nDuckDB    : ${config.duckdbPath}`);
     console.log(`Global CSV: ${config.globalExportDir}`);

@@ -32,6 +32,7 @@ export type Config = {
   heliusMinIntervalMs: number;
   retryAttempts: number;
   retryBackoffMs: number;
+  rescanSkipSec: number;
 
   minMarketTradeSol: number;
   minLeaderTradeSol: number;
@@ -178,6 +179,7 @@ export function loadConfig(): Config {
     heliusMinIntervalMs: nonNegativeInt('HELIUS_MIN_INTERVAL_MS'),
     retryAttempts: positiveInt('RETRY_ATTEMPTS'),
     retryBackoffMs: positiveInt('RETRY_BACKOFF_MS'),
+    rescanSkipSec: nonNegativeInt('RESCAN_SKIP_SEC'),
 
     minMarketTradeSol: positive('MIN_MARKET_TRADE_SOL'),
     minLeaderTradeSol: positive('MIN_LEADER_TRADE_SOL'),

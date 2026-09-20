@@ -6,6 +6,7 @@ import {
   type RawTransaction,
   type Trade,
 } from "../src/analyzer";
+import { shouldSkipRescan } from "../src/rescan";
 
 const baseConfig = {
   heliusApiKey: "x", heliusRpcBaseUrl: "x", heliusPageLimit: 100, maxHistoryPages: 100,
@@ -156,6 +157,21 @@ function fetchShell(trades: Trade[]): FetchResult {
     lightweightCacheHit: false, fullCacheHits: 0, fullCacheMisses: 0, fullQueryWindows: 1, parseDropCounts: drop,
   };
 }
+
+describe("fresh-artifact skip", () => {
+  const NOW = Date.parse("2026-09-20T20:00:00.000Z");
+  test("skips fresh artifacts, scans stale ones", () => {
+    expect(shouldSkipRescan({ scannedAt: "2026-09-20T19:00:00.000Z" }, NOW, 86400)).toBe(true);
+    expect(shouldSkipRescan({ scannedAt: "2026-09-19T19:00:00.000Z" }, NOW, 86400)).toBe(false);
+    expect(shouldSkipRescan({ scannedAt: "2026-09-20T19:00:00.000Z", status: "error" }, NOW, 86400)).toBe(true);
+  });
+  test("fails open to scanning on missing/garbage/disabled", () => {
+    expect(shouldSkipRescan(null, NOW, 86400)).toBe(false);
+    expect(shouldSkipRescan({}, NOW, 86400)).toBe(false);
+    expect(shouldSkipRescan({ scannedAt: "not-a-date" }, NOW, 86400)).toBe(false);
+    expect(shouldSkipRescan({ scannedAt: "2026-09-20T19:00:00.000Z" }, NOW, 0)).toBe(false);
+  });
+});
 
 describe("prospective ranking (no lookahead)", () => {
   test("pre-pump buyer leads on entry evidence; pure chaser is observed but unranked", () => {
