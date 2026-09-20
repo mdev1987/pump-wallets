@@ -104,6 +104,8 @@ export type PumpWindow = {
   sellSol: number;
   buyCount: number;
   sellCount: number;
+  /** True when window netBuy <= 0: distribution top, not accumulation-led. Not persisted to DuckDB (JSON only). */
+  isDistribution?: boolean;
 };
 
 export type BuyAttribution = {
@@ -130,6 +132,8 @@ export type WalletLeader = {
   leadEvidenceScore: number;
   pumpsLed: number;
   pumpCount: number;
+  /** Pumps where this wallet bought strictly before start (secondsFromPumpStart < 0). Ranking key: repeat pre-pump beats chaser-heavy totals. */
+  prePumpPumps: number;
   medianSecondsBeforePump: number | null;
   earliestSecondsBeforePump: number | null;
   avgPumpBuyFlowShare: number | null;
@@ -1185,6 +1189,7 @@ function buildPumpWindows(
       sellSol: metrics.sellSol,
       buyCount: metrics.buyCount,
       sellCount: metrics.sellCount,
+      isDistribution: metrics.netBuySol <= 0,
     });
 
   };
@@ -1485,10 +1490,25 @@ function buildWalletPumpObservations(
 
     const control = baselineByPump.get(pump.id);
     if (!control) continue;
-    const controlSufficient = control.buyCount >= CONFIG.minControlBuysPerPump;
-    const controlShortfallReason = controlSufficient
-      ? null
-      : `control buys ${control.buyCount}/${CONFIG.minControlBuysPerPump}`;
+    // Control contamination check: if this pump's control interval overlaps any
+    // other pump's pre/early context, remaining "non-leading" buys are still in
+    // a pump regime (e.g. pump2 control overlapping pump1 pre-pump). Flag it
+    // instead of silently treating excess as clean.
+    const controlStart = pump.startTimestamp - CONFIG.prePumpSec - CONFIG.controlGapSec - CONFIG.controlLookbackSec;
+    const controlEnd = pump.startTimestamp - CONFIG.prePumpSec - CONFIG.controlGapSec;
+    const overlappingPump = pumpWindows.find((other) => {
+      if (other.id === pump.id) return false;
+      const otherStart = other.startTimestamp - CONFIG.prePumpSec;
+      const otherEnd = other.startTimestamp + CONFIG.earlyPumpSec;
+      return controlStart <= otherEnd && controlEnd >= otherStart;
+    });
+    const baseSufficient = control.buyCount >= CONFIG.minControlBuysPerPump;
+    const controlSufficient = baseSufficient && !overlappingPump;
+    const controlShortfallReason = !baseSufficient
+      ? `control buys ${control.buyCount}/${CONFIG.minControlBuysPerPump}`
+      : overlappingPump
+        ? `control overlaps pump ${overlappingPump.id} context`
+        : null;
 
     const secondsBefore = items
       .map((item) => item.secondsFromPumpStart)
@@ -1683,6 +1703,11 @@ function summarizeWallets(
     const buys = walletTrades.filter((trade) => trade.type === 'buy');
     const sells = walletTrades.filter((trade) => trade.type === 'sell');
     const prePumpItems = prePumpAttributionsByWallet.get(wallet) ?? [];
+    // True pre-pump leaders only: pure early-pump chasers (zero buys with
+    // secondsFromPumpStart < 0) are excluded here. They remain in
+    // pumpBuyEvents for forensics but must not rank as "lead" wallets.
+    const prePumpPumps = pumpObservations.filter((o) => o.prePumpBuyCount > 0).length;
+    if (prePumpItems.length === 0 || prePumpPumps === 0) continue;
 
     const buySol = buys.reduce((sum, trade) => sum + trade.solAmount, 0);
     const sellSol = sells.reduce((sum, trade) => sum + trade.solAmount, 0);
@@ -1797,16 +1822,22 @@ function summarizeWallets(
         ? forward30Median - globalForward30
         : null;
 
+    const totalPrePumpBuySol = pumpObservations.reduce((sum, item) => sum + item.prePumpBuySol, 0);
+    const dustFlag = totalPrePumpBuySol < 0.5 ? `dust pre-pump ${totalPrePumpBuySol.toFixed(3)} SOL` : `pre-pump ${totalPrePumpBuySol.toFixed(2)} SOL`;
+    const medianLeadFlag = medianLeadSec === null
+      ? 'lead timing n/a'
+      : medianLeadSec <= 0
+        ? `median CHASER +${(-medianLeadSec).toFixed(1)}s after start`
+        : `median lead ${medianLeadSec.toFixed(1)}s`;
     const reasons = [
-      `${pumpObservations.length} independent pump window${pumpObservations.length === 1 ? '' : 's'}`,
-      medianLeadSec === null
-        ? 'lead timing n/a'
-        : `median lead ${medianLeadSec.toFixed(1)}s`,
+      `${pumpObservations.length} independent pump window${pumpObservations.length === 1 ? '' : 's'} (${prePumpPumps} with pre-pump buys)`,
+      medianLeadFlag,
+      dustFlag,
       controlAdjustedForward30Median === null
         ? 'control-adjusted 30s response n/a'
         : `median 30s excess ${(controlAdjustedForward30Median * 100).toFixed(2)}%`,
       pumpObservations.some((item) => !item.controlSufficient)
-        ? 'control baseline insufficient on some pumps'
+        ? 'control baseline insufficient/contaminated on some pumps'
         : 'control baseline sufficient',
       controlPositive30Lift === null
         ? 'control 30s positive-rate lift n/a'
@@ -1824,6 +1855,7 @@ function summarizeWallets(
       leadEvidenceScore: totalLeadEvidenceScore,
       pumpsLed: pumpObservations.length,
       pumpCount: pumpObservations.length,
+      prePumpPumps,
       medianSecondsBeforePump: medianLeadSec,
       earliestSecondsBeforePump: leadSeconds.length ? Math.max(...leadSeconds) : null,
       avgPumpBuyFlowShare: medianFlow,
@@ -1848,7 +1880,9 @@ function summarizeWallets(
       firstBuyTime: firstBuy.time,
       lastBuyTime: lastBuy.time,
       pumpBuys: pumpObservations.reduce((sum, item) => sum + item.buyCount, 0),
-      pumpBuySol: pumpObservations.reduce((sum, item) => sum + item.prePumpBuySol, 0),
+      // Total pump-window SOL (pre + early). Previously summed pre-only while
+      // named pumpBuySol, understating chaser-heavy wallets.
+      pumpBuySol: pumpObservations.reduce((sum, item) => sum + item.prePumpBuySol + item.earlyPumpBuySol, 0),
       prePumpBuys: prePumpItems.length,
       prePumpBuySol: prePumpItems.reduce(
         (sum, item) => sum + item.trade.solAmount,
@@ -1919,11 +1953,19 @@ function summarizeWallets(
     });
   }
 
+  // Rank true pre-pump repeatability first: pumps WITH pre-pump buys, then
+  // total pumps, control-adjusted edge, per-pump evidence (size+timing aware)
+  // and pre-pump SOL. pumpsLed includes early-only (chaser) pumps, so it alone
+  // lets repeat chasers outrank true predictors — prePumpPumps goes first.
   leaders.sort(
     (a, b) =>
+      b.prePumpPumps - a.prePumpPumps ||
+      b.pumpsLed - a.pumpsLed ||
       (b.reliabilityAdjustedExcessForward30Median ?? -Infinity) -
         (a.reliabilityAdjustedExcessForward30Median ?? -Infinity) ||
-      b.pumpsLed - a.pumpsLed ||
+      (b.meanLeadEvidenceScorePerPump ?? -Infinity) -
+        (a.meanLeadEvidenceScorePerPump ?? -Infinity) ||
+      b.prePumpBuySol - a.prePumpBuySol ||
       b.independentPumpCoverage - a.independentPumpCoverage ||
       (b.reliabilityAdjusted30PumpRate ?? -Infinity) -
         (a.reliabilityAdjusted30PumpRate ?? -Infinity) ||
@@ -1932,8 +1974,8 @@ function summarizeWallets(
       (b.controlPositive30Lift ?? -Infinity) -
         (a.controlPositive30Lift ?? -Infinity) ||
       b.leadEvidenceScore - a.leadEvidenceScore ||
-      (a.medianSecondsBeforePump ?? Number.POSITIVE_INFINITY) -
-        (b.medianSecondsBeforePump ?? Number.POSITIVE_INFINITY) ||
+      (b.medianSecondsBeforePump ?? Number.NEGATIVE_INFINITY) -
+        (a.medianSecondsBeforePump ?? Number.NEGATIVE_INFINITY) ||
       a.wallet.localeCompare(b.wallet),
   );
 
@@ -1946,12 +1988,21 @@ function summarizeWallets(
 export function selectStrongestPump(pumpWindows: PumpWindow[]): PumpWindow | null {
   if (!pumpWindows.length) return null;
 
+  // Prefer accumulation-led pumps (netBuy > 0). A distribution top with
+  // negative netBuy (e.g. pump 5 live: -2.5 SOL, +267%) must not outrank a
+  // genuine accumulation pump on peakReturn alone.
   return [...pumpWindows].sort(
-    (a, b) =>
-      b.peakReturn - a.peakReturn ||
-      b.max30sReturn - a.max30sReturn ||
-      b.netBuySol - a.netBuySol ||
-      a.startTimestamp - b.startTimestamp,
+    (a, b) => {
+      const aDist = a.netBuySol <= 0 ? 1 : 0;
+      const bDist = b.netBuySol <= 0 ? 1 : 0;
+      return (
+        aDist - bDist ||
+        b.peakReturn - a.peakReturn ||
+        b.max30sReturn - a.max30sReturn ||
+        b.netBuySol - a.netBuySol ||
+        a.startTimestamp - b.startTimestamp
+      );
+    },
   )[0] ?? null;
 }
 

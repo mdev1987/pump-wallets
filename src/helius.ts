@@ -153,6 +153,7 @@ type LightCacheFile = {
     fineActivityBucketSec: number;
     pageLimit: number;
     maxPages: number;
+    maxSignatures: number;
   };
   pages: number;
   transactionsReturned: number;
@@ -213,8 +214,12 @@ function hydrateLightCache(
     cached.config.activityBucketSec !== config.activityBucketSec ||
     cached.config.fineActivityBucketSec !== config.fineActivityBucketSec ||
     cached.config.pageLimit !== config.heliusLightPageLimit ||
-    cached.config.maxPages !== config.maxLightHistoryPages
+    cached.config.maxPages !== config.maxLightHistoryPages ||
+    cached.config.maxSignatures !== config.maxLightSignatures
   ) return null;
+
+  // A cache written under a looser density cap must not bypass the guard.
+  if (cached.transactionsReturned > config.maxLightSignatures) return null;
 
   return {
     pages: cached.pages,
@@ -287,6 +292,17 @@ async function scanActivityHistory(
     const page = result?.data ?? [];
     transactionsReturned += page.length;
 
+    // Density guard: ultra-dense tokens would split into more full-query
+    // windows than this box can fetch (MAX_FULL_QUERY_WINDOWS) and keep in
+    // RAM. Fail fast here — signatures-only pages are cheap — instead of
+    // burning full-transaction credits for a scan that cannot complete.
+    if (transactionsReturned > config.maxLightSignatures) {
+      throw new Error(
+        `Token ${token}: light scan reached ${transactionsReturned} signatures, above MAX_LIGHT_SIGNATURES=${config.maxLightSignatures}. ` +
+        `Token too dense for this budget; skipping without full history (no truncation).`,
+      );
+    }
+
     for (const row of page) {
       if (typeof row.blockTime !== 'number' || !Number.isFinite(row.blockTime)) continue;
       firstBlockTime ??= row.blockTime;
@@ -327,6 +343,7 @@ async function scanActivityHistory(
         fineActivityBucketSec: config.fineActivityBucketSec,
         pageLimit: config.heliusLightPageLimit,
         maxPages: config.maxLightHistoryPages,
+        maxSignatures: config.maxLightSignatures,
       },
       pages,
       transactionsReturned,

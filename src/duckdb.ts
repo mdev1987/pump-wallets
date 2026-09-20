@@ -58,12 +58,33 @@ export class ResearchDb {
     if (slash > 0) await mkdir(config.duckdbPath.slice(0, slash), { recursive: true });
 
     await logger.info(`Opening DuckDB: ${config.duckdbPath}`);
+    // Clamp threads for 1-2 vCPU boxes; DuckDB defaults would oversubscribe.
+    const threads = Math.max(1, Math.min(config.duckdbThreads, 2));
     const instance = await DuckDBInstance.create(config.duckdbPath, {
-      threads: String(config.duckdbThreads),
+      threads: String(threads),
     });
     const connection = await instance.connect();
     const db = new ResearchDb(connection);
+    // Bound analytical memory on small VPS (2GB): spill to disk, not OOM.
+    // 600MB leaves headroom for Bun (~150-250MB) + OS within 2GB.
+    try {
+      await connection.run(`SET threads TO ${threads}`);
+    } catch { /* older builds ignore SET threads */ }
+    try {
+      await connection.run(`SET memory_limit='600MB'`);
+    } catch { /* ignore if unsupported */ }
+    try {
+      await mkdir('./data/tmp', { recursive: true });
+      await connection.run(`SET temp_directory='./data/tmp'`);
+    } catch { /* ignore if unsupported */ }
+    try {
+      await connection.run(`SET checkpoint_threshold='64MB'`);
+    } catch { /* ignore if unsupported */ }
     await db.initializeSchema();
+    // Reclaim WAL on open so repeated DeBot-only runs don't grow it unbounded.
+    try {
+      await connection.run(`CHECKPOINT`);
+    } catch { /* ignore */ }
     return db;
   }
 

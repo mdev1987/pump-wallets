@@ -650,11 +650,18 @@ function buildSignal(
   // Heatmap is intentionally excluded from pumpPrecursorScore. It is market
   // context and should not silently become a token-level directional signal.
   const isTrending = activity.score !== null && activity.score >= config.minActivityScore;
+  // Raw pace ratio gate: volumeAcceleration is per-minute pace (1.0 = same pace).
+  // pump.volume is the normalized 0..1 score and must NOT be compared to the
+  // raw >1.0 threshold (that comparison could never pass and silently disabled
+  // all candidates).
+  const volumeGatePassed =
+    volumeAcceleration !== null && volumeAcceleration > config.minVolumeAcceleration;
   const isPumpPrecursorCandidate =
     pump.score !== null &&
     pump.score >= config.minPumpPrecursorScore &&
     pump.evidenceCount >= config.minPumpPrecursorEvidence &&
-    pump.volume !== null && pump.volume > config.minVolumeAcceleration &&
+    pump.volume !== null &&
+    volumeGatePassed &&
     pump.positiveEvidenceCount >= config.minPumpPrecursorPositiveEvidence &&
     (!config.requireHeatmap || (attachedHeatmap.heatmapSeen && heatmapRecent));
 
@@ -663,9 +670,9 @@ function buildSignal(
   if (isTrending) candidateReasons.push("high-current-activity");
   if (pump.buyPressure !== null && pump.buyPressure > 0.5) candidateReasons.push(`buy-pressure ${(pump.buyPressure * 100).toFixed(1)}%`);
   if (pump.buyPressureDelta !== null && pump.buyPressureDelta > 0) candidateReasons.push(`buy-delta +${(pump.buyPressureDelta * 100).toFixed(1)}pp`);
-  if (pump.volume !== null && pump.volume > 1) candidateReasons.push(`volume ${pump.volume.toFixed(2)}x`);
-  if (pump.volume !== null && pump.volume <= config.minVolumeAcceleration) candidateReasons.push(`volume-gate ${pump.volume.toFixed(2)}x`);
-  if (pump.wallet !== null && pump.wallet > 1) candidateReasons.push(`wallets ${pump.wallet.toFixed(2)}x`);
+  if (volumeAcceleration !== null && volumeAcceleration > 1) candidateReasons.push(`volume ${volumeAcceleration.toFixed(2)}x`);
+  if (volumeAcceleration !== null && volumeAcceleration <= config.minVolumeAcceleration) candidateReasons.push(`volume-gate ${volumeAcceleration.toFixed(2)}x`);
+  if (walletAcceleration !== null && walletAcceleration > 1) candidateReasons.push(`wallets ${walletAcceleration.toFixed(2)}x`);
   if (attachedHeatmap.heatmapSeen) candidateReasons.push(heatmapRecent ? "heatmap-recent" : "heatmap-stale");
   if (heatmapScore !== null && heatmapScore === 0) candidateReasons.push("heatmap-outside-recent-window");
 

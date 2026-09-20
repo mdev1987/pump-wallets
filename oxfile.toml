@@ -1,0 +1,57 @@
+version = 1
+
+# Solana pump-wallet research scanner (Bun/TypeScript) — v11 fixed.
+# Pipeline: DeBot 1m/5m/heatmap discovery -> Helius signatures-only light scan
+#   -> busiest + quiet windows -> Helius full tx (parse-and-discard)
+#   -> fast/sustained pump detector -> wallet x pump attribution + controls
+#   -> DuckDB + per-token JSON/CSV.
+# See README.md for methodology. Keys come from .env (gitignored, never commit).
+# .env is tuned for 2GB RAM / 1-2 vCPU VPS (serial token, 4 active + 1 quiet,
+# 2500 tx/window, DuckDB threads=1, memory_limit=600MB in code).
+# Apply with: oxmgr apply ./oxfile.toml   (from this directory)
+# Logs with:  oxmgr logs pump-wallets -f
+
+[[apps]]
+name = "pump-wallets"
+# --smol keeps Bun GC memory low on 2GB box. Bun loads .env automatically
+# (src/config.ts reads Bun.env). Absolute bun path so daemon is PATH-independent.
+# Single-instance guard: if a previous scan is still running (cron fired early,
+# manual run, apply race), the new invocation exits 0 immediately via
+# --conflict-exit-code 99 + test, so on-failure does NOT crash-loop it; the next
+# cron tick picks up the work. This prevents two processes writing the same
+# DuckDB/response.json concurrently (seen in logs 03:03:07 + 03:03:41 overlap).
+# One-shot batch: exits 0 after DeBot+Helius+DuckDB run. on-failure (not always)
+# so a clean run does NOT hot-loop DeBot/Helius; cron_restart schedules live scans.
+command = "/bin/sh -c '/usr/bin/flock -n --conflict-exit-code 99 /tmp/pump-wallets.lock /home/mdev/.bun/bin/bun --smol run get_pump_wallets.ts || test $? -eq 99'"
+cwd = "/home/mdev/Programming/pump-wallets-final-v11-fixed"
+restart_policy = "on-failure"
+max_restarts = 20
+# Stop after 5 crash-restarts inside 5 minutes: a persistent config error
+# (e.g. missing .env keys, exit code != 0) must error-state, not hot-loop.
+# 0 would disable this protection entirely.
+crash_restart_limit = 5
+restart_delay_secs = 30
+stop_signal = "SIGTERM"
+stop_timeout_secs = 20
+# Batch job: 8 DeBot tokens serial take ~10-20 min. Cron every 30 min avoids
+# killing a mid-run scan; health allows 40 min staleness. Missing file
+# = fresh boot, pass.
+health_cmd = "/bin/sh -c 'test ! -f /home/mdev/Programming/pump-wallets-final-v11-fixed/logs/scanner.log || test -n \"$(/usr/bin/find /home/mdev/Programming/pump-wallets-final-v11-fixed/logs/scanner.log -mmin -40 2>/dev/null)\"'"
+health_interval_secs = 180
+health_timeout_secs = 5
+health_max_failures = 3
+# OOM guard for 2GB VPS (box has ~380M avail, no swap by default — add swap
+# separately). Kills + restarts (on-failure) instead of taking the box down.
+max_memory_mb = 800
+# Live mode: DeBot discovery run every 30 min. Full Helius cache TTLs are 24h
+# in .env so repeat runs are cheap (light cache hit); new windows refetch.
+cron_restart = "*/30 * * * *"
+# Deps must resolve before a reload cuts over; a failed sync aborts the
+# reload and the old process keeps running.
+pre_reload_cmd = "/bin/sh -c 'cd /home/mdev/Programming/pump-wallets-final-v11-fixed && /home/mdev/.bun/bin/bun install --frozen-lockfile'"
+unified_logs = true
+
+[apps.env]
+PATH = "/home/mdev/.bun/bin:/home/mdev/.cargo/bin:/usr/local/bin:/home/mdev/.local/bin:/usr/bin:/bin"
+HOME = "/home/mdev"
+NODE_ENV = "production"

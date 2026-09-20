@@ -8,6 +8,7 @@ export type Config = {
   maxHistoryPages: number;
   heliusLightPageLimit: number;
   maxLightHistoryPages: number;
+  maxLightSignatures: number;
   activityBucketSec: number;
   activeWindowSec: number;
   activeWindowCount: number;
@@ -153,6 +154,7 @@ export function loadConfig(): Config {
     maxHistoryPages: positiveInt('MAX_HISTORY_PAGES'),
     heliusLightPageLimit: positiveInt('HELIUS_LIGHT_PAGE_LIMIT'),
     maxLightHistoryPages: positiveInt('MAX_LIGHT_HISTORY_PAGES'),
+    maxLightSignatures: positiveInt('MAX_LIGHT_SIGNATURES'),
     activityBucketSec: positiveInt('ACTIVITY_BUCKET_SEC'),
     activeWindowSec: positiveInt('ACTIVE_WINDOW_SEC'),
     activeWindowCount: positiveInt('ACTIVE_WINDOW_COUNT'),

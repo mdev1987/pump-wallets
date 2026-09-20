@@ -251,8 +251,8 @@ function printResponseSummary(response: IntegratedResponse, config: Config): voi
 
   const top = response.walletLeaders.slice(0, Math.min(config.topWallets, response.walletLeaders.length));
   if (top.length) {
-    console.log('rank | wallet                                           | rel30   | pumps | leadSec | coverage');
-    console.log('-----+--------------------------------------------------+---------+-------+---------+---------');
+    console.log('rank | wallet                                           | rel30   | pre/total | leadSec | coverage');
+    console.log('-----+--------------------------------------------------+---------+-----------+---------+---------');
     for (const leader of top) {
       const rel = leader.reliabilityAdjustedExcessForward30Median === null
         ? '    n/a'
@@ -260,8 +260,11 @@ function printResponseSummary(response: IntegratedResponse, config: Config): voi
       const lead = leader.medianSecondsBeforePump === null
         ? '    n/a'
         : leader.medianSecondsBeforePump.toFixed(1).padStart(7);
+      // pre/total = pumps with strictly pre-pump buys / all led pumps.
+      // A 0/n row is a pure chaser and never ranks (filtered in analyzer).
+      const preTotal = `${leader.prePumpPumps}/${leader.pumpsLed}`.padStart(9);
       console.log(
-        `${String(leader.rank).padStart(4)} | ${leader.wallet.padEnd(48)} | ${rel} | ${String(leader.pumpsLed).padStart(5)} | ${lead} | ${(leader.independentPumpCoverage * 100).toFixed(1).padStart(7)}%`,
+        `${String(leader.rank).padStart(4)} | ${leader.wallet.padEnd(48)} | ${rel} | ${preTotal} | ${lead} | ${(leader.independentPumpCoverage * 100).toFixed(1).padStart(7)}%`,
       );
     }
   }
