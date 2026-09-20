@@ -130,7 +130,12 @@ export class ResearchDb {
         quiet_windows_json VARCHAR,
         lightweight_cache_hit BOOLEAN NOT NULL DEFAULT FALSE,
         full_cache_hits INTEGER NOT NULL DEFAULT 0,
-        full_cache_misses INTEGER NOT NULL DEFAULT 0
+        full_cache_misses INTEGER NOT NULL DEFAULT 0,
+        run_id VARCHAR,
+        scan_started_at VARCHAR,
+        scan_completed_at VARCHAR,
+        scan_status VARCHAR NOT NULL DEFAULT 'completed',
+        scan_error VARCHAR
       );
 
       ALTER TABLE tokens ADD COLUMN IF NOT EXISTS scan_source VARCHAR DEFAULT 'cli';
@@ -156,7 +161,11 @@ export class ResearchDb {
       ALTER TABLE tokens ADD COLUMN IF NOT EXISTS lightweight_cache_hit BOOLEAN DEFAULT FALSE;
       ALTER TABLE tokens ADD COLUMN IF NOT EXISTS full_cache_hits INTEGER DEFAULT 0;
       ALTER TABLE tokens ADD COLUMN IF NOT EXISTS full_cache_misses INTEGER DEFAULT 0;
-
+      ALTER TABLE tokens ADD COLUMN IF NOT EXISTS run_id VARCHAR;
+      ALTER TABLE tokens ADD COLUMN IF NOT EXISTS scan_started_at VARCHAR;
+      ALTER TABLE tokens ADD COLUMN IF NOT EXISTS scan_completed_at VARCHAR;
+      ALTER TABLE tokens ADD COLUMN IF NOT EXISTS scan_status VARCHAR DEFAULT 'completed';
+      ALTER TABLE tokens ADD COLUMN IF NOT EXISTS scan_error VARCHAR;
       CREATE TABLE IF NOT EXISTS pump_windows (
         token_ca VARCHAR NOT NULL,
         pump_id INTEGER NOT NULL,
@@ -444,6 +453,23 @@ export class ResearchDb {
         avg_reliability_adjusted30_pump_rate DOUBLE,
         avg_reliability_adjusted_excess_forward30 DOUBLE
       );
+
+      -- Run provenance + ML-readiness columns. All ALTERs live here, after
+      -- every CREATE, so fresh databases migrate in one pass.
+      ALTER TABLE tokens ADD COLUMN IF NOT EXISTS run_id VARCHAR;
+      ALTER TABLE tokens ADD COLUMN IF NOT EXISTS scan_started_at VARCHAR;
+      ALTER TABLE tokens ADD COLUMN IF NOT EXISTS scan_completed_at VARCHAR;
+      ALTER TABLE tokens ADD COLUMN IF NOT EXISTS scan_status VARCHAR DEFAULT 'completed';
+      ALTER TABLE tokens ADD COLUMN IF NOT EXISTS scan_error VARCHAR;
+      ALTER TABLE pump_windows ADD COLUMN IF NOT EXISTS run_id VARCHAR;
+      ALTER TABLE control_baselines ADD COLUMN IF NOT EXISTS run_id VARCHAR;
+      ALTER TABLE wallet_pump_observations ADD COLUMN IF NOT EXISTS run_id VARCHAR;
+      ALTER TABLE pump_buy_events ADD COLUMN IF NOT EXISTS run_id VARCHAR;
+      ALTER TABLE wallet_token_summary ADD COLUMN IF NOT EXISTS run_id VARCHAR;
+      ALTER TABLE wallet_token_summary ADD COLUMN IF NOT EXISTS control_backed_pumps INTEGER DEFAULT 0;
+      ALTER TABLE wallet_token_summary ADD COLUMN IF NOT EXISTS predictive_qualified BOOLEAN DEFAULT FALSE;
+      ALTER TABLE debot_signals ADD COLUMN IF NOT EXISTS liquidity_bucket VARCHAR;
+      ALTER TABLE debot_signals ADD COLUMN IF NOT EXISTS market_cap_bucket VARCHAR;
     `);
   }
 
@@ -467,12 +493,13 @@ export class ResearchDb {
       await this.connection.run('DELETE FROM wallet_token_summary WHERE token_ca = $token', { token });
       await this.connection.run('DELETE FROM tokens WHERE token_ca = $token', { token });
 
+      const runId = response.runId ?? 'adhoc';
       await this.appendToken(response, scanSource, debotSignal, debotObservedAt);
-      await this.appendPumpWindows(token, response.pumpWindows);
-      await this.appendControlBaselines(token, response.controlBaselines);
-      await this.appendObservations(token, response.walletPumpObservations);
-      await this.appendPumpBuyEvents(token, response.pumpBuyEvents);
-      await this.appendWalletTokenSummaries(token, response.walletLeaders);
+      await this.appendPumpWindows(token, response.pumpWindows, runId);
+      await this.appendControlBaselines(token, response.controlBaselines, runId);
+      await this.appendObservations(token, response.walletPumpObservations, runId);
+      await this.appendPumpBuyEvents(token, response.pumpBuyEvents, runId);
+      await this.appendWalletTokenSummaries(token, response.walletLeaders, runId);
 
       await this.connection.run('COMMIT');
     } catch (error) {
@@ -515,6 +542,7 @@ export class ResearchDb {
       row.marketWalletAcceleration ?? null, row.marketVolumeAcceleration ?? null, row.signalCount == null ? null : BigInt(Math.trunc(row.signalCount)),
       row.signalMaxPriceGain ?? null, row.signalTokenLevel ?? null, row.heatmapToSignalLagSec == null ? null : BigInt(Math.trunc(row.heatmapToSignalLagSec)),
       row.isTrending, row.isPumpPrecursorCandidate, row.candidateReason ?? null,
+      row.liquidityBucket ?? null, row.marketCapBucket ?? null,
     ]);
   }
 
@@ -573,6 +601,7 @@ export class ResearchDb {
       'selected_active_hours', 'selected_active_windows', 'full_query_windows',
       'selected_active_hours_json', 'active_windows_json', 'parse_drop_counts_json',
       'selected_quiet_windows', 'quiet_windows_json', 'lightweight_cache_hit', 'full_cache_hits', 'full_cache_misses',
+      'run_id', 'scan_started_at', 'scan_completed_at', 'scan_status', 'scan_error',
     ];
 
     await this.connection.run(
@@ -617,30 +646,38 @@ export class ResearchDb {
         response.history.lightweightCacheHit,
         response.history.fullCacheHits,
         response.history.fullCacheMisses,
+        response.runId ?? 'adhoc',
+        response.scanStartedAt ?? response.scannedAt,
+        response.scanCompletedAt ?? response.scannedAt,
+        'completed',
+        null,
       ],
     );
   }
 
-  private async appendPumpWindows(token: string, rows: PumpWindow[]): Promise<void> {
+  private async appendPumpWindows(token: string, rows: PumpWindow[], runId: string): Promise<void> {
     await this.insertRows('pump_windows', rows, (row) => [
       token, row.id, row.startTimestamp, row.startTime, row.endTimestamp, row.endTime,
       row.startPriceSol, row.peakPriceSol, row.peakTimestamp, row.peakReturn,
       row.max15sReturn, row.max30sReturn, row.netBuySol, row.buySol, row.sellSol,
       row.buyCount, row.sellCount,
+      runId,
     ]);
   }
 
-  private async appendControlBaselines(token: string, rows: ControlBaseline[]): Promise<void> {
+  private async appendControlBaselines(token: string, rows: ControlBaseline[], runId: string): Promise<void> {
     await this.insertRows('control_baselines', rows, (row) => [
       token, row.pumpId, row.pumpStartTime, row.windowStartTime, row.windowEndTime,
       row.buyCount, row.buySol, row.availableBuyCount, row.availableBuySol,
       row.forward5Median ?? null, row.forward15Median ?? null, row.forward30Median ?? null, row.forward60Median ?? null,
       row.positive5Rate ?? null, row.positive15Rate ?? null, row.positive30Rate ?? null, row.positive60Rate ?? null,
+      runId,
     ]);
   }
 
-  private async appendObservations(token: string, rows: WalletPumpObservation[]): Promise<void> {
+  private async appendObservations(token: string, rows: WalletPumpObservation[], runId: string): Promise<void> {
     await this.insertRows('wallet_pump_observations', rows, (row) => [
+      // run_id is ALTER-appended physically last; keep it last here too.
       token, row.wallet, row.pumpId, row.pumpStartTime, row.pumpEndTime, row.pumpReturn, row.pumpBuySol,
       row.buyCount, row.prePumpBuyCount, row.prePumpBuySol, row.earlyPumpBuyCount, row.earlyPumpBuySol, row.controlSufficient, row.controlShortfallReason ?? null, row.medianSecondsBeforePump ?? null,
       row.p25SecondsBeforePump ?? null, row.p75SecondsBeforePump ?? null, row.earliestSecondsBeforePump ?? null,
@@ -657,20 +694,24 @@ export class ResearchDb {
       row.controlPositive15Rate ?? null, row.controlPositive30Rate ?? null, row.controlPositive60Rate ?? null,
       row.excessForward5Median ?? null, row.excessForward15Median ?? null, row.excessForward30Median ?? null, row.excessForward60Median ?? null,
       row.positive15Lift ?? null, row.positive30Lift ?? null, row.positive60Lift ?? null,
+      runId,
     ]);
   }
 
-  private async appendPumpBuyEvents(token: string, rows: PumpBuyEventOutput[]): Promise<void> {
+  private async appendPumpBuyEvents(token: string, rows: PumpBuyEventOutput[], runId: string): Promise<void> {
     await this.insertRows('pump_buy_events', rows, (row) => [
       token, row.pumpId, row.pumpStartTime, row.secondsBeforePump, row.time, row.timestamp, row.wallet,
       row.solAmount, row.tokenAmount, row.priceSol, row.signature, row.slot, row.pumpBuyFlowShare, row.localBuyFlowShare,
       row.forward1 ?? null, row.forward3 ?? null, row.forward5 ?? null, row.forward10 ?? null,
       row.forward15 ?? null, row.forward30 ?? null, row.forward60 ?? null, row.maxForward15 ?? null, row.maxForward30 ?? null,
       row.leadEvidenceScore,
+      runId,
     ]);
   }
 
-  private async appendWalletTokenSummaries(token: string, rows: WalletLeader[]): Promise<void> {
+  private async appendWalletTokenSummaries(token: string, rows: WalletLeader[], runId: string): Promise<void> {
+    // ALTER-appended columns (run_id, control_backed_pumps,
+    // predictive_qualified) are physically last; keep them last here too.
     await this.insertRows('wallet_token_summary', rows, (row) => [
       token, row.rank, row.wallet, row.leadEvidenceScore, row.pumpsLed, row.pumpCount,
       row.medianSecondsBeforePump ?? null, row.earliestSecondsBeforePump ?? null,
@@ -692,6 +733,9 @@ export class ResearchDb {
       row.controlAdjusted30PumpPositiveCount, row.controlAdjusted30PumpRate ?? null,
       row.reliabilityAdjusted30PumpRate ?? null, row.reliabilityAdjustedExcessForward30Median ?? null,
       row.qualificationReason,
+      runId,
+      row.controlBackedPumps,
+      row.predictiveQualified,
     ]);
   }
 
@@ -747,6 +791,50 @@ export class ResearchDb {
     await this.connection.run(`COPY (${query}) TO '${safePath}' (HEADER, DELIMITER ',')`);
   }
 
+  /**
+   * Record a failed token scan. Never overwrites a previous successful
+   * analysis: absence must not be mistaken for a negative example, and a past
+   * success must not be clobbered by a later budget skip.
+   */
+  async recordFailure(
+    args: {
+      token: string;
+      runId: string;
+      scanSource: string;
+      scanStartedAt: string;
+      scanStatus: TokenScanStatus;
+      error: string;
+    },
+    logger: Logger,
+  ): Promise<void> {
+    const safe = args.token.replace(/[^1-9A-HJ-NP-Za-km-z]/g, '');
+    if (safe !== args.token) throw new Error(`Unsafe token for failure record: ${args.token}`);
+    const reader = await this.connection.runAndReadAll(
+      `SELECT token_ca FROM tokens WHERE token_ca = '${safe}' LIMIT 1`,
+    );
+    if (reader.getRowObjects().length > 0) {
+      await logger.info(`Token ${args.token}: keeping previous successful analysis; failure recorded to response.json only`);
+      return;
+    }
+    const scannedAt = new Date().toISOString();
+    const columns = [
+      'token_ca', 'analysis_version', 'scanned_at', 'history_pages',
+      'transactions_returned', 'history_truncated', 'detected_trades',
+      'market_buckets', 'pump_starts', 'pump_windows', 'scan_source',
+      'run_id', 'scan_started_at', 'scan_completed_at', 'scan_status', 'scan_error',
+    ];
+    await logger.info(`Token ${args.token}: recording scan failure (${args.scanStatus})`);
+    await this.connection.run(
+      `INSERT INTO tokens (${columns.map(quoteIdentifier).join(', ')}) VALUES (${columns.map((_, i) => `$${i + 1}`).join(', ')})`,
+      [
+        args.token, 11, scannedAt, 0,
+        0, false, 0,
+        0, 0, 0, args.scanSource,
+        args.runId, args.scanStartedAt, scannedAt, args.scanStatus, args.error.slice(0, 2000),
+      ].map(sqlValue),
+    );
+  }
+
   /** Close the DuckDB connection using the method exposed by the current runtime. */
   close(): void {
     const connection = this.connection as unknown as {
@@ -779,6 +867,33 @@ export async function persistToken(
   debotObservedAt: string | null = null,
 ): Promise<void> {
   await db.replaceToken(response, logger, scanSource, debotSignal, debotObservedAt);
+}
+
+export type TokenScanStatus =
+  | 'completed'
+  | 'budget_exceeded'
+  | 'light_history_too_dense'
+  | 'error';
+
+/**
+ * Record a failed token scan in DuckDB so budget-skipped tokens are visible
+ * as explicit scan_status rows instead of silently absent. Never overwrites a
+ * previous successful analysis: absence must not be mistaken for a negative
+ * example, and a past success must not be clobbered by a later budget skip.
+ */
+export async function recordTokenFailure(
+  db: ResearchDb,
+  logger: Logger,
+  args: {
+    token: string;
+    runId: string;
+    scanSource: string;
+    scanStartedAt: string;
+    scanStatus: TokenScanStatus;
+    error: string;
+  },
+): Promise<void> {
+  await db.recordFailure(args, logger);
 }
 
 /** Export a global analytical table/query for pandas, Polars, or Excel. */

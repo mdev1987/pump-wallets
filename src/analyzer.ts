@@ -134,6 +134,14 @@ export type WalletLeader = {
   pumpCount: number;
   /** Pumps where this wallet bought strictly before start (secondsFromPumpStart < 0). Ranking key: repeat pre-pump beats chaser-heavy totals. */
   prePumpPumps: number;
+  /** Pumps with a sufficient (uncontaminated, large-enough) control baseline. */
+  controlBackedPumps: number;
+  /**
+   * ML-ready flag: at least one pre-pump pump AND at least one
+   * control-sufficient pump. Observations without controls stay in the
+   * dataset for forensics but must not train a predictive score.
+   */
+  predictiveQualified: boolean;
   medianSecondsBeforePump: number | null;
   earliestSecondsBeforePump: number | null;
   avgPumpBuyFlowShare: number | null;
@@ -328,6 +336,14 @@ export type AnalysisResponse = {
   version: 11;
   token: string;
   scannedAt: string;
+  /**
+   * Provenance for multi-run datasets: every row derived from this analysis
+   * carries runId across all DuckDB tables, so observations from different
+   * scan times are never silently mixed (no time leakage in ML).
+   */
+  runId: string;
+  scanStartedAt: string;
+  scanCompletedAt: string;
   source: {
     api: 'helius';
     method: 'getTransactionsForAddress';
@@ -541,6 +557,7 @@ export function parseTradesFromTransactionDetailed(
   let sawWalletBalance = false;
   let sawSolDelta = false;
   let sawDirectionMismatch = false;
+  let sawRouterLikeSwap = false;
   let sawInvalidAmount = false;
 
   for (const [wallet, token] of tokenOwners) {
@@ -574,7 +591,15 @@ export function parseTradesFromTransactionDetailed(
       type = 'sell';
       solAmountLamports = solDeltaLamports;
     } else {
-      sawDirectionMismatch = true;
+      // Aggregator/router multi-leg swaps move real SOL in a pattern the
+      // single-trade buy/sell model cannot attribute (same-sign flows, fee
+      // accounts). At/above 0.01 SOL this is signal, not dust: count it
+      // separately so router-heavy tokens are diagnosable. Still rejected —
+      // no attributable single trade — never silently accepted.
+      // Threshold is a lamports constant (not CONFIG) to keep the parser
+      // deterministic and usable without analyzer configuration.
+      if (Math.abs(solDeltaLamports) >= 10_000_000) sawRouterLikeSwap = true;
+      else sawDirectionMismatch = true;
       continue;
     }
 
@@ -617,6 +642,7 @@ export function parseTradesFromTransactionDetailed(
   if (!sawSignerWallet) return { trades: [], reason: 'wallet_not_signer' };
   if (!sawWalletBalance) return { trades: [], reason: 'missing_wallet_sol_balance' };
   if (!sawSolDelta) return { trades: [], reason: 'zero_sol_delta' };
+  if (sawRouterLikeSwap) return { trades: [], reason: 'router_like_swap' };
   if (sawDirectionMismatch) return { trades: [], reason: 'sol_direction_mismatch' };
   if (sawInvalidAmount) return { trades: [], reason: 'invalid_amount' };
   return { trades: [], reason: 'sol_direction_mismatch' };
@@ -642,6 +668,7 @@ export type ParseDropReason =
   | 'missing_wallet_sol_balance'
   | 'zero_sol_delta'
   | 'sol_direction_mismatch'
+  | 'router_like_swap'
   | 'invalid_amount';
 
 export type ParseDropCounts = Record<ParseDropReason, number>;
@@ -1469,9 +1496,17 @@ function buildWalletPumpObservations(
 ): WalletPumpObservation[] {
   const groups = new Map<string, BuyAttribution[]>();
   const baselineByPump = new Map(controlBaselines.map((item) => [item.pumpId, item]));
+  // Distribution tops (netBuy <= 0) are violent price events, not buy-driven
+  // pumps. Leading one earns no leadership credit: excluded from wallet x pump
+  // observations and leaders. Windows, controls and pumpBuyEvents keep them
+  // for forensics.
+  const distributionPumpIds = new Set(
+    pumpWindows.filter((pump) => pump.isDistribution).map((pump) => pump.id),
+  );
 
   for (const item of attributions) {
     if (item.leadPumpId === null || item.leadEvidenceScore <= 0) continue;
+    if (distributionPumpIds.has(item.leadPumpId)) continue;
     if (item.trade.solAmount < CONFIG.minLeaderTradeSol) continue;
     if (item.secondsFromPumpStart === null || item.secondsFromPumpStart >= CONFIG.earlyPumpSec) continue;
 
@@ -1822,6 +1857,8 @@ function summarizeWallets(
         ? forward30Median - globalForward30
         : null;
 
+    const controlBackedPumps = pumpObservations.filter((item) => item.controlSufficient).length;
+    const predictiveQualified = prePumpPumps >= 1 && controlBackedPumps >= 1;
     const totalPrePumpBuySol = pumpObservations.reduce((sum, item) => sum + item.prePumpBuySol, 0);
     const dustFlag = totalPrePumpBuySol < 0.5 ? `dust pre-pump ${totalPrePumpBuySol.toFixed(3)} SOL` : `pre-pump ${totalPrePumpBuySol.toFixed(2)} SOL`;
     const medianLeadFlag = medianLeadSec === null
@@ -1837,8 +1874,11 @@ function summarizeWallets(
         ? 'control-adjusted 30s response n/a'
         : `median 30s excess ${(controlAdjustedForward30Median * 100).toFixed(2)}%`,
       pumpObservations.some((item) => !item.controlSufficient)
-        ? 'control baseline insufficient/contaminated on some pumps'
+        ? `control-backed on ${controlBackedPumps}/${pumpObservations.length} pumps`
         : 'control baseline sufficient',
+      predictiveQualified
+        ? 'predictive-qualified (pre-pump + control-backed evidence)'
+        : 'observational only (no joint pre-pump + control-backed evidence)',
       controlPositive30Lift === null
         ? 'control 30s positive-rate lift n/a'
         : `median 30s positive-rate lift ${(controlPositive30Lift * 100).toFixed(1)}pp`,
@@ -1856,6 +1896,8 @@ function summarizeWallets(
       pumpsLed: pumpObservations.length,
       pumpCount: pumpObservations.length,
       prePumpPumps,
+      controlBackedPumps,
+      predictiveQualified,
       medianSecondsBeforePump: medianLeadSec,
       earliestSecondsBeforePump: leadSeconds.length ? Math.max(...leadSeconds) : null,
       avgPumpBuyFlowShare: medianFlow,
@@ -1954,12 +1996,13 @@ function summarizeWallets(
   }
 
   // Rank true pre-pump repeatability first: pumps WITH pre-pump buys, then
-  // total pumps, control-adjusted edge, per-pump evidence (size+timing aware)
-  // and pre-pump SOL. pumpsLed includes early-only (chaser) pumps, so it alone
-  // lets repeat chasers outrank true predictors — prePumpPumps goes first.
+  // CONTROL-BACKED pumps (observational-only evidence must not outrank
+  // counterfactual-backed evidence), then total pumps, control-adjusted edge,
+  // per-pump evidence (size+timing aware) and pre-pump SOL.
   leaders.sort(
     (a, b) =>
       b.prePumpPumps - a.prePumpPumps ||
+      b.controlBackedPumps - a.controlBackedPumps ||
       b.pumpsLed - a.pumpsLed ||
       (b.reliabilityAdjustedExcessForward30Median ?? -Infinity) -
         (a.reliabilityAdjustedExcessForward30Median ?? -Infinity) ||
@@ -2017,8 +2060,11 @@ export function analyzeToken(
   config: Config,
   tokenAddress: string,
   fetchResult: FetchResult,
+  run?: { runId: string; scanStartedAt: string },
 ): AnalysisResponse {
   configureAnalyzer(config);
+  const runId = run?.runId ?? 'adhoc';
+  const scanStartedAt = run?.scanStartedAt ?? new Date().toISOString();
 
   // Helius pages are parsed before this function is called. Only the compact
   // Trade[] is retained, which keeps memory roughly proportional to actual
@@ -2060,6 +2106,9 @@ export function analyzeToken(
     version: 11,
     token: tokenAddress,
     scannedAt: new Date().toISOString(),
+    runId,
+    scanStartedAt,
+    scanCompletedAt: new Date().toISOString(),
     source: {
       api: 'helius',
       method: 'getTransactionsForAddress',

@@ -649,6 +649,7 @@ async function fetchFullWindows(
     missing_wallet_sol_balance: 0,
     zero_sol_delta: 0,
     sol_direction_mismatch: 0,
+    router_like_swap: 0,
     invalid_amount: 0,
   };
 
@@ -707,6 +708,7 @@ async function fetchFullWindows(
       missing_wallet_sol_balance: 0,
       zero_sol_delta: 0,
       sol_direction_mismatch: 0,
+    router_like_swap: 0,
       invalid_amount: 0,
     };
 
@@ -756,12 +758,11 @@ async function fetchFullWindows(
 
       for (const transaction of page) {
         const detailed = parseTradesFromTransactionDetailed(transaction, token);
+        // detailed.reason is already 'accepted_transactions' when trades were
+        // parsed (one count per transaction). Counting it again here used to
+        // double accepted_transactions (2x accepted_trades pattern in logs).
         parseDropCounts[detailed.reason] += 1;
         windowParseDropCounts[detailed.reason] += 1;
-        if (detailed.trades.length > 0) {
-          parseDropCounts.accepted_transactions += 1;
-          windowParseDropCounts.accepted_transactions += 1;
-        }
         parseDropCounts.accepted_trades += detailed.trades.length;
         windowParseDropCounts.accepted_trades += detailed.trades.length;
 
@@ -875,6 +876,7 @@ export async function fetchTransactions(
         missing_wallet_sol_balance: 0,
         zero_sol_delta: 0,
         sol_direction_mismatch: 0,
+    router_like_swap: 0,
         invalid_amount: 0,
       },
     };

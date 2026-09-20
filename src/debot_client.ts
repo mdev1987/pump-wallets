@@ -248,6 +248,14 @@ export type DeBotTrendingSignal = DeBotHeatmapContext & {
   marketCap: number | null;
   fdv: number | null;
 
+  /**
+   * Coarse liquidity regimes so pump behavior can be compared within
+   * comparable books instead of mixing $5k dust with $300M majors.
+   * Thresholds are arbitrary research buckets, not financial advice.
+   */
+  liquidityBucket: 'dust' | 'micro' | 'mid' | 'deep' | null;
+  marketCapBucket: 'dust' | 'micro' | 'mid' | 'large' | null;
+
   smartWalletOnlineCount1m: number | null;
   smartWalletTotalCount1m: number | null;
   smartWalletCoverage1m: number | null;
@@ -403,6 +411,23 @@ function positiveDeltaScore(delta: number | null, saturation: number): number | 
 function buyPressureScore(value: number | null): number | null {
   if (value === null) return null;
   return clamp01((value - 0.5) / 0.5);
+}
+
+/** Coarse USD regimes for comparing pumps within comparable liquidity books. */
+function liquidityBucket(value: number | null): 'dust' | 'micro' | 'mid' | 'deep' | null {
+  if (value === null || !Number.isFinite(value) || value < 0) return null;
+  if (value < 50_000) return 'dust';
+  if (value < 500_000) return 'micro';
+  if (value < 5_000_000) return 'mid';
+  return 'deep';
+}
+
+function marketCapBucket(value: number | null): 'dust' | 'micro' | 'mid' | 'large' | null {
+  if (value === null || !Number.isFinite(value) || value < 0) return null;
+  if (value < 250_000) return 'dust';
+  if (value < 2_000_000) return 'micro';
+  if (value < 200_000_000) return 'mid';
+  return 'large';
 }
 
 function recentHeatmapScore(recencySec: number | null, maxRecencySec: number): number | null {
@@ -722,6 +747,8 @@ function buildSignal(
     holders: numberOrNull(primaryMarket.holders),
     marketCap: numberOrNull(primaryMarket.mkt_cap),
     fdv: numberOrNull(primaryMarket.fdv),
+    liquidityBucket: liquidityBucket(numberOrNull(primary?.pair_summary_info?.liquidity)),
+    marketCapBucket: marketCapBucket(numberOrNull(primaryMarket.mkt_cap)),
     smartWalletOnlineCount1m: numberOrNull(item1m?.smart_wallet_online_count),
     smartWalletTotalCount1m: numberOrNull(item1m?.smart_wallet_total_count),
     smartWalletCoverage1m: smartCoverage(item1m),

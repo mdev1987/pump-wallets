@@ -129,6 +129,7 @@ wallet_not_signer
 missing_wallet_sol_balance
 zero_sol_delta
 sol_direction_mismatch
+router_like_swap
 invalid_amount
 ```
 

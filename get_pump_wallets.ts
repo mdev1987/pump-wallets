@@ -5,7 +5,7 @@ import {
   type AnalysisResponse,
 } from './src/analyzer';
 import { loadConfig, type Config } from './src/config';
-import { exportGlobalCsv, persistToken, ResearchDb } from './src/duckdb';
+import { exportGlobalCsv, persistToken, recordTokenFailure, ResearchDb, type TokenScanStatus } from './src/duckdb';
 import { fetchTransactions } from './src/helius';
 import { Logger } from './src/logger';
 import { objectsToCsv } from './src/csv';
@@ -156,6 +156,14 @@ async function writeTokenResponse(
   );
 }
 
+/** Map a scan error to an explicit status so budget skips are never implicit. */
+function classifyScanError(error: unknown): TokenScanStatus {
+  const message = error instanceof Error ? error.message : String(error);
+  if (message.includes('MAX_LIGHT_SIGNATURES')) return 'light_history_too_dense';
+  if (message.includes('MAX_FULL_QUERY_WINDOWS')) return 'budget_exceeded';
+  return 'error';
+}
+
 /** Run Helius analysis for one token; DuckDB persistence stays serial. */
 async function analyzeOne(
   config: Config,
@@ -164,15 +172,17 @@ async function analyzeOne(
   source: TokenSource,
   debotObservedAt: string | null,
   debotSignal: DeBotTrendingSignal | null,
+  runId: string,
 ): Promise<IntegratedResponse> {
-  await logger.info(`Token ${token}: starting historical scan | source=${source}`);
+  await logger.info(`Token ${token}: starting historical scan | source=${source} run=${runId}`);
+  const scanStartedAt = new Date().toISOString();
 
   // Helius parses pages into compact trades, so the parser must receive the
   // current mint explicitly. This avoids mutable token state and prevents a
   // token-address filter from silently dropping every trade.
   const fetched = await fetchTransactions(token, config, logger);
   await logger.info(`Token ${token}: Helius returned ${fetched.transactionsReturned} transactions; retained ${fetched.trades.length} compact trades`);
-  const analysis = analyzeToken(config, token, fetched);
+  const analysis = analyzeToken(config, token, fetched, { runId, scanStartedAt });
   const response: IntegratedResponse = {
     ...analysis,
     integration: {
@@ -381,6 +391,11 @@ async function main(): Promise<void> {
     console.log(`DeBot candidates  : ${debotCandidates.length}`);
     console.log('Helius token mode  : serial (1 token at a time)');
 
+    // One analysis_run_id per invocation so multi-run datasets never mix
+    // scan times implicitly (run_id propagates to every DuckDB row).
+    const runId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    await rootLogger.info(`Analysis run ${runId} | tokens=${tokens.length}`);
+
     // Deliberately process tokens serially. A full Helius page is parsed and
     // discarded immediately, and only the compact Trade[] survives. This keeps
     // peak RAM bounded by one token instead of N concurrent full histories.
@@ -388,6 +403,7 @@ async function main(): Promise<void> {
     for (const [index, token] of tokens.entries()) {
       const logger = rootLogger.child(token);
       console.log(`\n[${index + 1}/${tokens.length}] Analyzing ${token}`);
+      const tokenScanStartedAt = new Date().toISOString();
       try {
         const debotSignal = debotSnapshot?.signals.find((signal) => signal.address === token) ?? null;
         const source = sources.get(token)!;
@@ -398,6 +414,7 @@ async function main(): Promise<void> {
           source,
           debotSnapshot?.fetchedAt ?? null,
           debotSignal,
+          runId,
         );
 
         await persistToken(
@@ -417,6 +434,8 @@ async function main(): Promise<void> {
         );
       } catch (error) {
         await logger.error(`Token ${token}: scan failed`, error);
+        const scanStatus = classifyScanError(error);
+        const errorMessage = error instanceof Error ? error.message : String(error);
         const dir = tokenDir(config, token);
         await mkdir(dir, { recursive: true });
         await Bun.write(
@@ -426,13 +445,30 @@ async function main(): Promise<void> {
             token,
             status: 'error',
             scannedAt: new Date().toISOString(),
+            runId,
+            scanStartedAt: tokenScanStartedAt,
+            scanStatus,
             integration: {
               scanSource: sources.get(token) ?? 'cli',
               debotObservedAt: debotSnapshot?.fetchedAt ?? null,
             },
-            error: error instanceof Error ? error.message : String(error),
+            error: errorMessage,
           }, null, 2),
         );
+        // Best-effort DB failure record: budget skips stay visible as explicit
+        // scan_status rows and never overwrite a previous success.
+        try {
+          await recordTokenFailure(db, logger, {
+            token,
+            runId,
+            scanSource: sources.get(token) ?? 'cli',
+            scanStartedAt: tokenScanStartedAt,
+            scanStatus,
+            error: errorMessage,
+          });
+        } catch (dbError) {
+          await logger.error(`Token ${token}: failure record failed (original error preserved)`, dbError);
+        }
       }
     }
 
