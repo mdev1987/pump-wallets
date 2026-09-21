@@ -2,3 +2,5 @@
 node_modules/
 data/
 logs/
+paper-copy/paper_state.json
+paper-copy/paper_state.json.tmp

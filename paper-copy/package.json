@@ -1,0 +1,21 @@
+{
+  "name": "paper-copy",
+  "module": "paper-copy.ts",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "bun run paper-copy.ts",
+    "check": "tsc --noEmit -p tsconfig.json",
+    "test": "bun test paper.test.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^7.0.2"
+  },
+  "dependencies": {
+    "grammy": "^1.46.0",
+    "telegram-markdown-v2": "^0.0.5"
+  }
+}
