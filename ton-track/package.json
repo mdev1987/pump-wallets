@@ -1,0 +1,21 @@
+{
+  "name": "ton-track",
+  "module": "ton-track.ts",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "bun run ton-track.ts",
+    "check": "tsc --noEmit -p tsconfig.json",
+    "test": "bun test track.test.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^7.0.2"
+  },
+  "dependencies": {
+    "grammy": "^1.46.0",
+    "telegram-markdown-v2": "^0.0.5"
+  }
+}

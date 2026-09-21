@@ -85,3 +85,30 @@ unified_logs = true
 PATH = "/home/mdev/.bun/bin:/home/mdev/.cargo/bin:/usr/local/bin:/home/mdev/.local/bin:/usr/bin:/bin"
 HOME = "/home/mdev"
 NODE_ENV = "production"
+
+# TON paper tracker: DexScreener price tracking + entry-now / entry-4h-ago
+# paper scenarios on one TON token, reported to a dedicated Telegram bot.
+# Read-only market data, paper ledger in ton-track/ton_state.json.
+[[apps]]
+name = "ton-track"
+command = "/home/mdev/.bun/bin/bun --smol run ton-track/ton-track.ts"
+cwd = "/home/mdev/Programming/pump-wallets-final-v11-fixed"
+restart_policy = "always"
+max_restarts = 100
+crash_restart_limit = 5
+restart_delay_secs = 30
+stop_signal = "SIGTERM"
+stop_timeout_secs = 20
+# Ticks every 60s; a log older than 10 minutes means the loop is stuck.
+health_cmd = "/bin/sh -c 'test ! -f /home/mdev/.local/share/oxmgr/logs/ton-track.log || test -n \"$(/usr/bin/find /home/mdev/.local/share/oxmgr/logs/ton-track.log -mmin -10 2>/dev/null)\"'"
+health_interval_secs = 120
+health_timeout_secs = 5
+health_max_failures = 3
+max_memory_mb = 256
+pre_reload_cmd = "/bin/sh -c 'cd /home/mdev/Programming/pump-wallets-final-v11-fixed/ton-track && /home/mdev/.bun/bin/bun install --frozen-lockfile'"
+unified_logs = true
+
+[apps.env]
+PATH = "/home/mdev/.bun/bin:/home/mdev/.cargo/bin:/usr/local/bin:/home/mdev/.local/bin:/usr/bin:/bin"
+HOME = "/home/mdev"
+NODE_ENV = "production"

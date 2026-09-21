@@ -15,6 +15,8 @@ export type EngineConfig = {
   maxHoldSec: number;
   feeOpenSol: number;
   feeLegSol: number;
+  /** Display unit for money math (default SOL). TON trackers use USD. */
+  unitLabel?: string;
 };
 
 export const DEFAULT_CONFIG: EngineConfig = {
@@ -151,7 +153,7 @@ export function tickPosition(cfg: EngineConfig, pos: Position, priceUsd: number,
   if (ret >= cfg.tp2Pct && pos.remainingQty > 0) closeRest('tp2', `TP2 +${(cfg.tp2Pct * 100).toFixed(0)}%`);
   else if (priceUsd <= pos.stopPriceUsd && pos.remainingQty > 0) {
     closeRest('trail', `trailing stop (${(cfg.trailPct * 100).toFixed(0)}% under peak)`);
-  } else if (nowMs - pos.openedAtMs >= cfg.maxHoldSec * 1000 && pos.remainingQty > 0) {
+  } else if (cfg.maxHoldSec > 0 && nowMs - pos.openedAtMs >= cfg.maxHoldSec * 1000 && pos.remainingQty > 0) {
     closeRest('timeout', `max hold ${(cfg.maxHoldSec / 60).toFixed(0)}m`);
   }
   return { partials, closed, closeReason };
@@ -186,6 +188,10 @@ export function assessRug(summary: unknown): RugAssessment {
   return { veto: false, reason: score === null ? 'unscored (warn-only)' : `score ${score}, no danger findings`, score };
 }
 
+export function unitOf(cfg: EngineConfig): string {
+  return cfg.unitLabel ?? 'SOL';
+}
+
 export function fmtUsd(v: number | null): string {
   if (v === null || !Number.isFinite(v)) return 'n/a';
   if (v === 0) return '$0';
@@ -218,7 +224,7 @@ export function openReport(cfg: EngineConfig, pos: Position, balanceAfterSol: nu
     `🟢 **PAPER OPEN** — $${pos.symbol} (${pos.mint.slice(0, 8)}…)`,
     ``,
     `👛 Wallet: \`${pos.walletLabel}\` (\`${pos.wallet.slice(0, 8)}…\`)`,
-    `💰 Entry: ${fmtUsd(pos.entryPriceUsd)} | Size: **${cfg.posSizeSol} SOL** (~${fmtUsd(valUsd)})`,
+    `💰 Entry: ${fmtUsd(pos.entryPriceUsd)} | Size: **${cfg.posSizeSol} ${unitOf(cfg)}** (~${fmtUsd(valUsd)})`,
     `👥 Tracked buyers (24h): **${pos.buyers24h}**`,
     ``,
     `🛡️ **Risk plan**`,
@@ -231,19 +237,19 @@ export function openReport(cfg: EngineConfig, pos: Position, balanceAfterSol: nu
     `• Liquidity: ${fmtUsd(pos.liqUsd)} | MCap: ${fmtUsd(pos.mcapUsd)} | Age: ${ageStr(pos.ageHours)}`,
     `• RugCheck score: ${pos.rugScore === null ? 'n/a (warn-only)' : pos.rugScore}`,
     ``,
-    `💼 Balance before: ${pos.balanceBeforeSol.toFixed(4)} SOL → after: ${balanceAfterSol.toFixed(4)} SOL`,
+    `💼 Balance before: ${pos.balanceBeforeSol.toFixed(4)} ${unitOf(cfg)} → after: ${balanceAfterSol.toFixed(4)} ${unitOf(cfg)}`,
     `🆔 \`${pos.id}\``,
   ].join('\n');
 }
 
 /** 🔔 Partial take-profit update. */
-export function partialReport(pos: Position, leg: ExitLeg, solUsd: number | null): string {
+export function partialReport(cfg: EngineConfig, pos: Position, leg: ExitLeg, solUsd: number | null): string {
   const usd = solUsd ? ` (~${fmtUsd(leg.pnlSol * solUsd)})` : '';
   return [
     `🔔 **PARTIAL TP** — $${pos.symbol}`,
     ``,
     `• Sold 50% at ${fmtUsd(leg.priceUsd)} (${fmtPct(leg.priceUsd / pos.entryPriceUsd - 1)})`,
-    `• Realized: **${leg.pnlSol >= 0 ? '+' : ''}${leg.pnlSol.toFixed(5)} SOL**${usd}`,
+    `• Realized: **${leg.pnlSol >= 0 ? '+' : ''}${leg.pnlSol.toFixed(5)} ${unitOf(cfg)}**${usd}`,
     `• Runner left: ${(pos.remainingQty).toFixed(2)} tokens | stop now ${fmtUsd(pos.stopPriceUsd)}`,
     `🆔 \`${pos.id}\``,
   ].join('\n');
@@ -259,10 +265,11 @@ export function closeReport(
 ): string {
   const pnl = positionPnlSol(pos) - cfg.feeOpenSol;
   const icon = pnl >= 0 ? '🟢' : '🔴';
+  const U = cfg.unitLabel ?? 'SOL';
   const winrate = stats.closed > 0 ? `${((stats.wins / stats.closed) * 100).toFixed(1)}% (${stats.wins}/${stats.closed})` : 'n/a';
   const usd = solUsd ? ` (~${fmtUsd(pnl * solUsd)})` : '';
   const legs = pos.legs
-    .map((l) => `• ${l.kind.toUpperCase()}: ${fmtUsd(l.priceUsd)} (${fmtPct(l.priceUsd / pos.entryPriceUsd - 1)}) → ${l.pnlSol >= 0 ? '+' : ''}${l.pnlSol.toFixed(5)} SOL`)
+    .map((l) => `• ${l.kind.toUpperCase()}: ${fmtUsd(l.priceUsd)} (${fmtPct(l.priceUsd / pos.entryPriceUsd - 1)}) → ${l.pnlSol >= 0 ? '+' : ''}${l.pnlSol.toFixed(5)} ${unitOf(cfg)}`)
     .join('\n');
   return [
     `${icon} **PAPER CLOSE** — $${pos.symbol} — ${pos.closeReason}`,
@@ -275,10 +282,10 @@ export function closeReport(
     `📜 **Legs**`,
     legs,
     ``,
-    `💰 **Position PnL: ${pnl >= 0 ? '+' : ''}${pnl.toFixed(5)} SOL**${usd}`,
-    `💼 Balance: ${pos.balanceBeforeSol.toFixed(4)} → **${balanceAfterSol.toFixed(4)} SOL**`,
+    `💰 **Position PnL: ${pnl >= 0 ? '+' : ''}${pnl.toFixed(5)} ${unitOf(cfg)}**${usd}`,
+    `💼 Balance: ${pos.balanceBeforeSol.toFixed(4)} → **${balanceAfterSol.toFixed(4)} ${unitOf(cfg)}**`,
     ``,
-    `📊 **Session**: winrate ${winrate} | total ${stats.totalPnlSol >= 0 ? '+' : ''}${stats.totalPnlSol.toFixed(4)} SOL over ${stats.closed} closed`,
+    `📊 **Session**: winrate ${winrate} | total ${stats.totalPnlSol >= 0 ? '+' : ''}${stats.totalPnlSol.toFixed(4)} ${unitOf(cfg)} over ${stats.closed} closed`,
     `🆔 \`${pos.id}\``,
   ].join('\n');
 }
@@ -289,8 +296,8 @@ export function startupReport(cfg: EngineConfig, tracked: number, balanceSol: nu
     `🚀 **Paper-copy reporter live**`,
     ``,
     `👀 Tracking **${tracked}** leader wallets (5-min sweep)`,
-    `💰 Size **${cfg.posSizeSol} SOL**/pos | TP +${(cfg.tp1Pct * 100).toFixed(0)}%/½ +${(cfg.tp2Pct * 100).toFixed(0)}% | Trail ${(cfg.trailPct * 100).toFixed(0)}% | Hold ≤${(cfg.maxHoldSec / 60).toFixed(0)}m`,
-    `💼 Paper balance: **${balanceSol.toFixed(4)} SOL**`,
+    `💰 Size **${cfg.posSizeSol} ${cfg.unitLabel ?? 'SOL'}**/pos | TP +${(cfg.tp1Pct * 100).toFixed(0)}%/½ +${(cfg.tp2Pct * 100).toFixed(0)}% | Trail ${(cfg.trailPct * 100).toFixed(0)}% | Hold ≤${(cfg.maxHoldSec / 60).toFixed(0)}m`,
+    `💼 Paper balance: **${balanceSol.toFixed(4)} ${cfg.unitLabel ?? 'SOL'}**`,
     `📝 Reports: open / partial-TP / close with PnL, winrate, balances`,
   ].join('\n');
 }
