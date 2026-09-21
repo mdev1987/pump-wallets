@@ -256,6 +256,20 @@ export function dayKey(ms: number): string {
 }
 
 /**
+ * Signatures-delta for the two-tier sweep: given newest-first signatures and
+ * the cursor, how many are fresh. Boot (null cursor) marks position without
+ * backfilling; a cursor missing from the window means the gap exceeds it.
+ */
+export function sigsDelta(sigs: string[], lastSig: string | null): { fresh: number; newest: string | null } {
+  if (!sigs.length) return { fresh: 0, newest: lastSig };
+  const newest = sigs[0]!;
+  if (lastSig === null) return { fresh: 0, newest };
+  const idx = sigs.indexOf(lastSig);
+  if (idx === -1) return { fresh: sigs.length, newest };
+  return { fresh: idx, newest };
+}
+
+/**
  * Momentum-chase veto: with minutes of copy latency behind the leader, buying
  * into an already-vertical 5-minute print means buying their top. Skip entries
  * already up more than maxPct in the last 5 minutes; null/unknown passes.

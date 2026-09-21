@@ -76,6 +76,17 @@ describe("entry gates", () => {
   });
 });
 
+describe("two-tier sweep delta", () => {
+  test("boot marks position, overlap counts fresh, miss takes window", async () => {
+    const { sigsDelta } = await import("./engine");
+    expect(sigsDelta([], null)).toEqual({ fresh: 0, newest: null });
+    expect(sigsDelta(['c', 'b', 'a'], null)).toEqual({ fresh: 0, newest: 'c' });
+    expect(sigsDelta(['c', 'b', 'a'], 'c')).toEqual({ fresh: 0, newest: 'c' });
+    expect(sigsDelta(['d', 'c', 'b'], 'b')).toEqual({ fresh: 2, newest: 'd' });
+    expect(sigsDelta(['z', 'y'], 'gone')).toEqual({ fresh: 2, newest: 'z' });
+  });
+});
+
 describe("paper engine lifecycle", () => {
   test("ladder fills rung by rung, closes when exhausted", () => {
     const p = mkPos(1.0);

@@ -15,6 +15,7 @@ import {
   assessRug,
   auditLedger,
   momentumBlocked,
+  sigsDelta,
   walletDayAllowed,
   walletDayRecord,
   openPosition,
@@ -129,6 +130,50 @@ async function fetchJson(url: string, init?: RequestInit, timeoutMs = HTTP_TIMEO
   }
 }
 
+async function postJson(url: string, body: unknown, timeoutMs = HTTP_TIMEOUT_MS): Promise<unknown> {
+  return fetchJson(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0' },
+    body: JSON.stringify(body),
+  }, timeoutMs);
+}
+
+function coolOnAuthError(pool: KeyPool, key: string, e: unknown): void {
+  if (String(e).includes('401') || String(e).includes('403') || String(e).includes('429')) pool.cool(key);
+}
+
+/** Tier 1: cheap newest-first signatures (10 credits flat) for change detection. */
+async function gtfaSignatures(pool: KeyPool, wallet: string, limit: number): Promise<string[]> {
+  const key = pool.next();
+  try {
+    const d = (await postJson(`https://mainnet.helius-rpc.com/?api-key=${key}`, {
+      jsonrpc: '2.0',
+      id: 'sigs',
+      method: 'getTransactionsForAddress',
+      params: [wallet, { transactionDetails: 'signatures', limit, sortOrder: 'desc' }],
+    })) as { result?: { data?: Array<{ signature?: string }> } };
+    return (d?.result?.data ?? []).map((r) => r.signature ?? '').filter(Boolean);
+  } catch (e) {
+    coolOnAuthError(pool, key, e);
+    throw e;
+  }
+}
+
+/** Tier 2: full Enhanced parse (100 credits) — only for the fresh delta. */
+async function enhancedHistory(pool: KeyPool, wallet: string, limit: number): Promise<EnhancedTx[]> {
+  const key = pool.next();
+  try {
+    const txs = (await fetchJson(
+      `https://api.helius.xyz/v0/addresses/${wallet}/transactions?api-key=${key}&limit=${limit}`,
+    )) as EnhancedTx[];
+    if (!Array.isArray(txs)) throw new Error('bad enhanced response');
+    return txs;
+  } catch (e) {
+    coolOnAuthError(pool, key, e);
+    throw e;
+  }
+}
+
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
 /** Round-robin Helius keys with cooldown on 401/403/429. */
@@ -235,33 +280,41 @@ type EnhancedTx = {
   nativeTransfers?: Array<{ fromUserAccount?: string; toUserAccount?: string; amount?: number }>;
 };
 
-async function recentBuys(pool: KeyPool, wallet: string, sinceSig: string | null): Promise<{ buys: Array<{ mint: string; solPaid: number; sig: string; ts: number }>; newestSig: string | null }> {
-  const buys: Array<{ mint: string; solPaid: number; sig: string; ts: number }> = [];
-  let newestSig: string | null = null;
-  const key = pool.next();
-  try {
-    const txs = (await fetchJson(
-      `https://api.helius.xyz/v0/addresses/${wallet}/transactions?api-key=${key}&limit=10`,
-    )) as EnhancedTx[];
-    if (!Array.isArray(txs)) return { buys, newestSig };
-    for (const t of txs) {
-      if (!newestSig) newestSig = t.signature;
-      if (sinceSig && t.signature === sinceSig) break;
-      if ((t.type ?? '').toUpperCase() !== 'SWAP') continue;
-      for (const tr of t.tokenTransfers ?? []) {
-        if (tr.toUserAccount !== wallet || !tr.mint || tr.mint === SOL_MINT) continue;
-        const paid = (t.nativeTransfers ?? [])
-          .filter((n) => n.fromUserAccount === wallet)
-          .reduce((s, n) => s + (n.amount ?? 0), 0) / 1e9;
-        if (paid >= MIN_COPY_BUY_SOL) buys.push({ mint: tr.mint, solPaid: paid, sig: t.signature, ts: t.timestamp });
-      }
-      if (sinceSig === null) break; // first boot: only mark position, never backfill
-    }
-  } catch (e) {
-    if (String(e).includes('401') || String(e).includes('403') || String(e).includes('429')) pool.cool(key);
-    throw e;
+type BuyEvent = { mint: string; solPaid: number; sig: string; ts: number };
+
+/**
+ * Two-tier wallet watch: Tier 1 GTFA signatures (10 credits flat) detect
+ * change; Tier 2 Enhanced (100 credits) parses only the fresh delta. A quiet
+ * wallet costs 10 credits instead of 100 — ~10x cheaper at idle.
+ */
+async function recentBuys(
+  pool: KeyPool,
+  wallet: string,
+  sinceSig: string | null,
+): Promise<{ buys: BuyEvent[]; newestSig: string | null; credits: number }> {
+  const buys: BuyEvent[] = [];
+  const sigs = await gtfaSignatures(pool, wallet, 100);
+  let credits = 10;
+  const { fresh, newest } = sigsDelta(sigs, sinceSig);
+  if (fresh === 0) return { buys, newestSig: newest ?? sinceSig, credits };
+  if (fresh >= sigs.length && sigs.length > 0) {
+    console.log(`gap larger than signature window for ${wallet.slice(0, 8)}, oldest skipped`);
   }
-  return { buys, newestSig };
+  const txs = await enhancedHistory(pool, wallet, Math.min(fresh + 5, 100));
+  credits += 100;
+  const freshSet = new Set(sigs.slice(0, fresh));
+  for (const t of txs) {
+    if (!freshSet.has(t.signature)) continue;
+    if ((t.type ?? '').toUpperCase() !== 'SWAP') continue;
+    for (const tr of t.tokenTransfers ?? []) {
+      if (tr.toUserAccount !== wallet || !tr.mint || tr.mint === SOL_MINT) continue;
+      const paid = (t.nativeTransfers ?? [])
+        .filter((n) => n.fromUserAccount === wallet)
+        .reduce((s, n) => s + (n.amount ?? 0), 0) / 1e9;
+      if (paid >= MIN_COPY_BUY_SOL) buys.push({ mint: tr.mint, solPaid: paid, sig: t.signature, ts: t.timestamp });
+    }
+  }
+  return { buys, newestSig: newest, credits };
 }
 
 async function main(): Promise<void> {
@@ -281,10 +334,16 @@ async function main(): Promise<void> {
     console.log(`telegram delivered message_id=${msg.message_id}`);
   };
 
-  // Boot probe: drop dead Helius keys before the sweep loop burns calls on them.
+  // Boot probe: drop dead Helius keys before the sweep loop burns calls on
+  // them. GTFA signatures (10 credits) instead of Enhanced (100).
   for (const k of pool.snapshot()) {
     try {
-      await fetchJson(`https://api.helius.xyz/v0/addresses/kEFiAX3jo5NmemysQov342TZ9mGh6yp92GDRjhA8XDf/transactions?api-key=${k}&limit=1`);
+      await postJson(`https://mainnet.helius-rpc.com/?api-key=${k}`, {
+        jsonrpc: '2.0',
+        id: 'probe',
+        method: 'getTransactionsForAddress',
+        params: ['kEFiAX3jo5NmemysQov342TZ9mGh6yp92GDRjhA8XDf', { transactionDetails: 'signatures', limit: 1, sortOrder: 'desc' }],
+      });
     } catch {
       pool.drop(k);
       console.log('dropping dead Helius key from rotation');
@@ -339,16 +398,19 @@ async function main(): Promise<void> {
     if (dirty) await saveState(state);
   };
 
-  const sweepWithErrors = async (): Promise<{ fresh: number; errors: number }> => {
+  const sweepWithErrors = async (): Promise<{ fresh: number; errors: number; credits: number }> => {
     let fresh = 0;
     let errors = 0;
+    let credits = 0;
     // breakerUntilMs is declared below alongside sweepLoop but initialized
     // before any sweep runs, so this read is safe at call time.
     const entriesPaused = Date.now() < breakerUntilMs;
     for (const t of tracked) {
       try {
-        const { buys, newestSig } = await recentBuys(pool, t.wallet, state.lastSig[t.wallet] ?? null);
-        if (newestSig) state.lastSig[t.wallet] = newestSig;
+        const r = await recentBuys(pool, t.wallet, state.lastSig[t.wallet] ?? null);
+        credits += r.credits;
+        if (r.newestSig) state.lastSig[t.wallet] = r.newestSig;
+        const { buys } = r;
         fresh += buys.length;
         if (entriesPaused) {
           await saveState(state);
@@ -432,7 +494,7 @@ async function main(): Promise<void> {
       }
       await sleep(WALLET_SPACING_MS);
     }
-    return { fresh, errors };
+    return { fresh, errors, credits };
   };
 
   // Price ticks every 30s idle, 15s while positions are open (TP levels live
@@ -453,10 +515,12 @@ async function main(): Promise<void> {
       const t0 = Date.now();
       let fresh = 0;
       let heliusErrors = 0;
+      let credits = 0;
       try {
         const r = await sweepWithErrors();
         fresh = r.fresh;
         heliusErrors = r.errors;
+        credits = r.credits;
       } catch (e) {
         console.warn('sweep', String(e).slice(0, 120));
         heliusErrors = TRACK_TOP_N;
@@ -481,7 +545,7 @@ async function main(): Promise<void> {
       if (problem) console.warn(`LEDGER AUDIT: ${problem}`);
       // Heartbeat every sweep: proves liveness even when the market is quiet
       // (no entries/exits), which the log-freshness health check needs.
-      console.log(`sweep complete: ${tracked.length} wallets, ${fresh} fresh buys, ${open} open, balance ${state.balanceSol.toFixed(4)} SOL, ${((Date.now() - t0) / 1000).toFixed(0)}s${paused ? ' BREAKER-PAUSED' : ''}${problem ? ' AUDIT-FAIL' : ''}`);
+      console.log(`sweep complete: ${tracked.length} wallets, ${fresh} fresh buys, ${open} open, balance ${state.balanceSol.toFixed(4)} SOL, ~${credits}cr, ${((Date.now() - t0) / 1000).toFixed(0)}s${paused ? ' BREAKER-PAUSED' : ''}${problem ? ' AUDIT-FAIL' : ''}`);
       await sleep(SWEEP_INTERVAL_MS);
     }
   };
