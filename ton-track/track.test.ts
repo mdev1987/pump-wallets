@@ -24,6 +24,44 @@ describe("4h-ago estimate", () => {
   });
 });
 
+describe("bot commands", () => {
+  const CA = 'EQCXA4bBsLMvftVAGvZuLJjK4k0sfewUOz7ZyVA57na2u7bY';
+  test("/open parses mint + optional size", async () => {
+    const { parseOpenCommand, isTonAddress, findOpenByMint } = await import("./track");
+    expect(isTonAddress(CA)).toBe(true);
+    expect(isTonAddress('So11111111111111111111111111111111111111112')).toBe(false);
+    expect(isTonAddress('hello')).toBe(false);
+    const a = parseOpenCommand(`/open ${CA}`, 25);
+    expect(a.ok).toBe(true);
+    if (a.ok) {
+      expect(a.mint).toBe(CA);
+      expect(a.sizeUsd).toBe(25);
+    }
+    const b = parseOpenCommand('/open EQCX 50', 25);
+    if (b.ok) throw new Error('short CA must not parse');
+    expect(b.ok).toBe(false);
+    const c = parseOpenCommand(`/open ${CA} abc`, 25);
+    expect(c.ok).toBe(false);
+    const d = parseOpenCommand(`/open ${CA} 40`, 25);
+    if (d.ok) expect(d.sizeUsd).toBe(40);
+    else throw new Error('sized open must parse');
+    const hit = findOpenByMint([{ mint: CA, status: 'open' }], CA.slice(0, 10));
+    expect(hit.found).toHaveLength(1);
+    expect(findOpenByMint([{ mint: CA, status: 'open' }], 'EQXX').found).toHaveLength(0);
+    expect(findOpenByMint([{ mint: CA, status: 'closed' }], CA).found).toHaveLength(0);
+  });
+});
+
+describe("pump-catcher config", () => {
+  test("wide plan: TP1 +50%, moonbag TP2, 24h hold, wide trail", async () => {
+    const { PUMP_CONFIG } = await import("./track");
+    expect(PUMP_CONFIG.tp1Pct).toBe(0.5);
+    expect(PUMP_CONFIG.tp2Pct).toBe(3.0);
+    expect(PUMP_CONFIG.trailPct).toBe(0.3);
+    expect(PUMP_CONFIG.maxHoldSec).toBe(24 * 3600);
+  });
+});
+
 describe("TON scenario lifecycle (USD units, no timeout)", () => {
   test("TP1 partial then TP2 close in USD", () => {
     const pos = openPosition(TON_CONFIG, {

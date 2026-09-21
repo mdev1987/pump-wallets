@@ -105,8 +105,8 @@ export function openPosition(
   };
 }
 
-/** Realized PnL of selling legQty at price vs entry, in SOL terms. */
-function legPnlSol(cfg: EngineConfig, pos: Position, legQty: number, priceUsd: number): number {
+/** Realized PnL of selling legQty at price vs entry, in position units. Exported for manual-close flows. */
+export function legPnlSol(cfg: EngineConfig, pos: Position, legQty: number, priceUsd: number): number {
   const entryCostShare = (legQty / pos.qtyTokens) * cfg.posSizeSol;
   const proceedsShare = (legQty / pos.qtyTokens) * cfg.posSizeSol * (priceUsd / pos.entryPriceUsd);
   return proceedsShare - entryCostShare - cfg.feeLegSol;
@@ -214,7 +214,9 @@ function ageStr(h: number | null): string {
 function durStr(ms: number): string {
   const s = Math.round(ms / 1000);
   if (s < 90) return `${s}s`;
-  return `${Math.floor(s / 60)}m ${s % 60}s`;
+  if (s < 5400) return `${Math.floor(s / 60)}m ${s % 60}s`;
+  const h = Math.floor(s / 3600);
+  return `${h}h ${Math.floor((s % 3600) / 60)}m`;
 }
 
 /** 🟢 Open-position alert body (standard Markdown, converted at send time). */

@@ -22,6 +22,57 @@ export const TON_CONFIG: EngineConfig = {
   maxHoldSec: 0, // disabled: tracker holds indefinitely for comparison
 };
 
+/**
+ * Wide pump-catcher: high TP with a moonbag runner, wide trailing stop,
+ * 24h max hold. Exits only on TP2 / trailing breach / timeout / manual
+ * /close — never on chop. Matches "don't quick the pos except on high risk".
+ */
+export const PUMP_CONFIG: EngineConfig = {
+  ...TON_CONFIG,
+  tp1Pct: 0.5, // +50% take half
+  tp1Share: 0.5,
+  tp2Pct: 3.0, // +300% take the rest (moonbag runner)
+  trailPct: 0.3, // wide: survive -30% drawdowns
+  trailTightPct: 0.2, // after TP1: still wide, locks partial only
+  maxHoldSec: 24 * 3600,
+};
+
+/** Raw TON address (48-char base64url, EQ/UQ mainnet prefixes). */
+export function isTonAddress(s: string): boolean {
+  return /^[EU][QF][A-Za-z0-9_-]{46}$/.test(s.trim());
+}
+
+export type ParsedOpen =
+  | { ok: true; mint: string; sizeUsd: number }
+  | { ok: false; error: string };
+
+/** Parse `/open <CA> [usd]`. Pure for testability. */
+export function parseOpenCommand(text: string, defaultSizeUsd: number): ParsedOpen {
+  const parts = text.trim().split(/\s+/).slice(1); // drop /open[@bot]
+  const [mintRaw = '', sizeRaw] = parts;
+  if (!mintRaw || !isTonAddress(mintRaw)) {
+    return { ok: false, error: 'Usage: /open <TON_CA> [usd] — e.g. `/open EQCX…2u7bY 25`' };
+  }
+  let sizeUsd = defaultSizeUsd;
+  if (sizeRaw !== undefined) {
+    sizeUsd = Number(sizeRaw);
+    if (!Number.isFinite(sizeUsd) || sizeUsd <= 0 || sizeUsd > 10_000) {
+      return { ok: false, error: 'Size must be a number 0–10000 (USD).' };
+    }
+  }
+  return { ok: true, mint: mintRaw.trim(), sizeUsd };
+}
+
+/** Find an open position by full mint or unambiguous prefix. Pure. */
+export function findOpenByMint<T extends { mint: string; status: string }>(
+  positions: T[],
+  query: string,
+): { found: T[] } {
+  const q = query.trim();
+  const found = positions.filter((p) => p.status === 'open' && (p.mint === q || (q.length >= 8 && p.mint.startsWith(q))));
+  return { found };
+}
+
 export type DexQuote = {
   priceUsd: number | null;
   liqUsd: number | null;

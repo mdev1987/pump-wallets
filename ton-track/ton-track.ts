@@ -10,17 +10,22 @@ import { convert } from 'telegram-markdown-v2';
 import { readFile, writeFile, rename } from 'node:fs/promises';
 import {
   TON_CONFIG,
+  PUMP_CONFIG,
   estimatePriceHoursAgo,
+  parseOpenCommand,
+  findOpenByMint,
   type DexQuote,
 } from './track';
 import {
   openPosition,
   tickPosition,
   positionPnlSol,
+  legPnlSol,
   openReport,
   partialReport,
   closeReport,
   startupReport,
+  type EngineConfig,
   type Position,
 } from '../paper-copy/engine';
 
@@ -34,10 +39,14 @@ const PAPER_USD = Number(process.env['TON_PAPER_USD'] ?? 25);
 const POLL_MS = Number(process.env['TON_POLL_SEC'] ?? 60) * 1000;
 const START_BANK_USD = 1000;
 
+type ScenarioName = 'now' | 'late4h' | 'pump';
+
 type State = {
   balanceUsd: number;
-  scenarios: Array<{ name: 'now' | 'late4h'; pos: Position; estimatedEntry: boolean; entryNote: string }>;
+  scenarios: Array<{ name: ScenarioName; pos: Position; estimatedEntry: boolean; entryNote: string }>;
   closed: Array<{ scenario: string; symbol: string; pnlSol: number; win: boolean; atMs: number }>;
+  /** Per-position engine config (pump-catcher vs tracker defaults). */
+  cfgs: Record<string, EngineConfig>;
   initializedAtMs: number | null;
 };
 
@@ -56,9 +65,11 @@ async function loadEnvFile(path: string): Promise<Record<string, string>> {
 
 async function loadState(): Promise<State> {
   try {
-    return JSON.parse(await readFile(STATE_PATH, 'utf8')) as State;
+    const s = JSON.parse(await readFile(STATE_PATH, 'utf8')) as State;
+    s.cfgs ??= {};
+    return s;
   } catch {
-    return { balanceUsd: START_BANK_USD, scenarios: [], closed: [], initializedAtMs: null };
+    return { balanceUsd: START_BANK_USD, scenarios: [], closed: [], cfgs: {}, initializedAtMs: null };
   }
 }
 
@@ -176,11 +187,16 @@ async function main(): Promise<void> {
 
   const CFG = { ...TON_CONFIG, posSizeSol: PAPER_USD };
   const state = await loadState();
+  // Legacy RizzGram scenarios predate per-position configs.
+  const cfgFor = (id: string): EngineConfig => state.cfgs[id] ?? CFG;
   const stats = (): { closed: number; wins: number; totalPnlSol: number } => ({
     closed: state.closed.length,
     wins: state.closed.filter((c) => c.pnlSol > 0).length,
     totalPnlSol: state.closed.reduce((s, c) => s + c.pnlSol, 0),
   });
+  const creditLeg = (pos: Position, cfg: EngineConfig, qty: number, price: number): void => {
+    state.balanceUsd += (qty / pos.qtyTokens) * cfg.posSizeSol * (price / pos.entryPriceUsd) - cfg.feeLegSol;
+  };
 
   if (state.initializedAtMs === null) {
     const q = await dexQuote(MINT);
@@ -206,6 +222,7 @@ async function main(): Promise<void> {
         rugScore: null,
       });
       state.balanceUsd -= CFG.posSizeSol + CFG.feeOpenSol;
+      state.cfgs[pos.id] = CFG;
       state.scenarios.push({ name, pos, estimatedEntry: estimated, entryNote: note });
     };
     mk('now', q.priceUsd, false, 'live first tick');
@@ -229,40 +246,196 @@ async function main(): Promise<void> {
   } else {
     await send(startupReport(CFG, 1, state.balanceUsd));
   }
-  void 0;
   console.log(`ton-track live: ${SYMBOL}, ${state.scenarios.filter((s) => s.pos.status === 'open').length} open scenarios`);
 
-  for (;;) {
+  const priceTick = async (): Promise<void> => {
+    const open = state.scenarios.filter((s) => s.pos.status === 'open');
+    if (!open.length) return;
+    const mints = [...new Set(open.map((s) => s.pos.mint))];
+    let quotes = new Map<string, DexQuote>();
     try {
-      const q = await dexQuote(MINT);
-      if (q?.priceUsd) {
-        const now = Date.now();
-        let dirty = false;
-        for (const s of state.scenarios) {
-          const pos = s.pos;
-          if (pos.status !== 'open') continue;
-          const ev = tickPosition(CFG, pos, q.priceUsd, now);
-          for (const leg of ev.partials) {
-            state.balanceUsd += (leg.qtyTokens / pos.qtyTokens) * CFG.posSizeSol * (leg.priceUsd / pos.entryPriceUsd) - CFG.feeLegSol;
-            dirty = true;
-            await send(partialReport(CFG, pos, leg, null));
-          }
-          if (ev.closed) {
-            const last = pos.legs.at(-1)!;
-            state.balanceUsd += (last.qtyTokens / pos.qtyTokens) * CFG.posSizeSol * (last.priceUsd / pos.entryPriceUsd) - CFG.feeLegSol;
-            const pnl = positionPnlSol(pos) - CFG.feeOpenSol;
-            state.closed.push({ scenario: s.name, symbol: pos.symbol, pnlSol: pnl, win: pnl > 0, atMs: now });
-            dirty = true;
-            await send(closeReport(CFG, pos, state.balanceUsd, null, stats()));
-          }
-        }
-        if (dirty) await saveState(state);
+      const data = (await fetchJson(`https://api.dexscreener.com/tokens/v1/ton/${mints.join(',')}`)) as Array<Record<string, unknown>>;
+      for (const p of Array.isArray(data) ? data : []) {
+        const addr = (p['baseToken'] as Record<string, string>)?.['address'] ?? '';
+        const px = p['priceUsd'] === null ? null : Number(p['priceUsd']);
+        if (addr && px) quotes.set(addr, { ...(await dexQuote(addr)), priceUsd: px } as DexQuote);
       }
     } catch (e) {
-      console.warn('tick failed', String(e).slice(0, 120));
+      console.warn('batch price tick failed', String(e).slice(0, 100));
+      return;
     }
-    await sleep(POLL_MS);
-  }
+    // Fall back per-mint on batch gaps.
+    for (const s of open) {
+      if (!quotes.has(s.pos.mint)) {
+        const q = await dexQuote(s.pos.mint).catch(() => null);
+        if (q?.priceUsd) quotes.set(s.pos.mint, q);
+      }
+    }
+    const now = Date.now();
+    let dirty = false;
+    for (const s of open) {
+      const pos = s.pos;
+      const cfg = cfgFor(pos.id);
+      const px = quotes.get(pos.mint)?.priceUsd;
+      if (!px) continue;
+      const ev = tickPosition(cfg, pos, px, now);
+      for (const leg of ev.partials) {
+        creditLeg(pos, cfg, leg.qtyTokens, leg.priceUsd);
+        dirty = true;
+        await send(partialReport(cfg, pos, leg, null));
+      }
+      if (ev.closed) {
+        const last = pos.legs.at(-1)!;
+        creditLeg(pos, cfg, last.qtyTokens, last.priceUsd);
+        const pnl = positionPnlSol(pos) - cfg.feeOpenSol;
+        state.closed.push({ scenario: s.name, symbol: pos.symbol, pnlSol: pnl, win: pnl > 0, atMs: now });
+        dirty = true;
+        await send(closeReport(cfg, pos, state.balanceUsd, null, stats()));
+      }
+    }
+    if (dirty) await saveState(state);
+  };
+
+  /** /close: full manual exit at the live price. */
+  const manualClose = async (query: string): Promise<string> => {
+    const { found } = findOpenByMint(state.scenarios.map((s) => s.pos), query);
+    if (found.length === 0) return `❌ No open position matches \`${query}\`. Use /status to list.`;
+    if (found.length > 1) {
+      return `❌ Ambiguous prefix — matches ${found.length} positions: ${found.map((p) => `\`${p.mint.slice(0, 12)}…\``).join(', ')}. Paste more of the address.`;
+    }
+    const pos = found[0]!;
+    const cfg = cfgFor(pos.id);
+    const q = await dexQuote(pos.mint).catch(() => null);
+    if (!q?.priceUsd) return `❌ No live price for \`${pos.mint.slice(0, 12)}…\`, position left open.`;
+    const now = Date.now();
+    const qty = pos.remainingQty;
+    pos.remainingQty = 0;
+    pos.status = 'closed';
+    pos.closeReason = 'manual /close';
+    pos.legs.push({ kind: 'timeout', priceUsd: q.priceUsd, qtyTokens: qty, pnlSol: legPnlSol(cfg, pos, qty, q.priceUsd), atMs: now });
+    creditLeg(pos, cfg, qty, q.priceUsd);
+    const pnl = positionPnlSol(pos) - cfg.feeOpenSol;
+    const sc = state.scenarios.find((s) => s.pos.id === pos.id)!;
+    state.closed.push({ scenario: sc.name, symbol: pos.symbol, pnlSol: pnl, win: pnl > 0, atMs: now });
+    await saveState(state);
+    await send(closeReport(cfg, pos, state.balanceUsd, null, stats()));
+    return `✅ Closed $${pos.symbol} at $${q.priceUsd} (${((q.priceUsd / pos.entryPriceUsd - 1) * 100).toFixed(1)}%). Report sent.`;
+  };
+
+  /** /open: validate, gate lightly (pump-catching), open, report. */
+  const openToken = async (text: string): Promise<string> => {
+    const parsed = parseOpenCommand(text, PAPER_USD);
+    if (!parsed.ok) return `❌ ${parsed.error}`;
+    const openCount = state.scenarios.filter((s) => s.pos.status === 'open').length;
+    if (openCount >= 5) return `❌ Too many open positions (${openCount}/5). /close one first.`;
+    if (state.scenarios.some((s) => s.pos.status === 'open' && s.pos.mint === parsed.mint)) {
+      return `❌ Already tracking \`${parsed.mint.slice(0, 12)}…\`.`;
+    }
+    const q = await dexQuote(parsed.mint).catch(() => null);
+    if (!q?.priceUsd) return `❌ No DexScreener price for that address (wrong chain or unknown token).`;
+    if ((q.liqUsd ?? 0) < 2000) return `❌ Liquidity too thin ($${(q.liqUsd ?? 0).toLocaleString()} < $2,000). Refusing.`;
+    const sizeUsd = parsed.sizeUsd;
+    if (state.balanceUsd < sizeUsd + PUMP_CONFIG.feeOpenSol) return `❌ Paper balance $${state.balanceUsd.toFixed(2)} < $${sizeUsd} + fee.`;
+    const cfg = { ...PUMP_CONFIG, posSizeSol: sizeUsd };
+    const now = Date.now();
+    const pos = openPosition(cfg, {
+      id: `pump-${now.toString(36)}`,
+      mint: parsed.mint,
+      symbol: q.symbol,
+      wallet: 'command',
+      walletLabel: 'manual /open — pump-catch',
+      entryPriceUsd: q.priceUsd,
+      solUsdAtEntry: 1,
+      atMs: now,
+      balanceBeforeSol: state.balanceUsd,
+      buyers24h: q.buys24h ?? 0,
+      liqUsd: q.liqUsd,
+      mcapUsd: q.mcapUsd,
+      ageHours: q.pairCreatedAtMs ? (now - q.pairCreatedAtMs) / 3600_000 : null,
+      rugScore: null,
+    });
+    state.balanceUsd -= sizeUsd + cfg.feeOpenSol;
+    state.cfgs[pos.id] = cfg;
+    state.scenarios.push({ name: 'pump', pos, estimatedEntry: false, entryNote: 'manual /open' });
+    await saveState(state);
+    await send(openReport(cfg, pos, state.balanceUsd, null));
+    return `✅ Tracking $${q.symbol} — pump-catch armed (TP +50%/+300%, trail 30%→20%, 24h). Exits only on TP/trail/timeout/manual.`;
+  };
+
+  const statusText = async (): Promise<string> => {
+    const open = state.scenarios.filter((s) => s.pos.status === 'open');
+    if (!open.length) return `📊 No open positions. Balance $${state.balanceUsd.toFixed(2)}. Use /open <CA> [usd].`;
+    const lines = [`📊 **Open (${open.length}) — balance $${state.balanceUsd.toFixed(2)}**`, ``];
+    for (const s of open) {
+      const q = await dexQuote(s.pos.mint).catch(() => null);
+      const cur = q?.priceUsd;
+      const ret = cur ? `${((cur / s.pos.entryPriceUsd - 1) * 100).toFixed(1)}%` : 'n/a';
+      const ageMs = Date.now() - s.pos.openedAtMs;
+      const age = ageMs < 5400_000 ? `${Math.round(ageMs / 60000)}m` : `${(ageMs / 3600_000).toFixed(1)}h`;
+      lines.push(`• $${s.pos.symbol} \`${s.pos.mint.slice(0, 10)}…\` entry $${s.pos.entryPriceUsd} → now ${cur ? `$${cur}` : 'n/a'} (**${ret}**, ${age})`);
+    }
+    const st = stats();
+    lines.push(``, `Session: ${st.wins}/${st.closed} wins, ${st.totalPnlSol >= 0 ? '+' : ''}$${st.totalPnlSol.toFixed(2)} total`);
+    return lines.join('\n');
+  };
+
+  bot.command('open', async (ctx) => {
+    try {
+      await ctx.reply(convert(await openToken(ctx.message?.text ?? '')), { parse_mode: 'MarkdownV2', link_preview_options: { is_disabled: true } });
+    } catch (e) {
+      await ctx.reply(`❌ open failed: ${String(e).slice(0, 200)}`);
+    }
+  });
+  bot.command('close', async (ctx) => {
+    try {
+      const q = (ctx.message?.text ?? '').split(/\s+/).slice(1).join(' ');
+      if (!q) {
+        await ctx.reply(convert('Usage: /close <CA or 8+ char prefix>'), { parse_mode: 'MarkdownV2' });
+        return;
+      }
+      await ctx.reply(convert(await manualClose(q)), { parse_mode: 'MarkdownV2', link_preview_options: { is_disabled: true } });
+    } catch (e) {
+      await ctx.reply(`❌ close failed: ${String(e).slice(0, 200)}`);
+    }
+  });
+  bot.command('status', async (ctx) => {
+    try {
+      await ctx.reply(convert(await statusText()), { parse_mode: 'MarkdownV2', link_preview_options: { is_disabled: true } });
+    } catch (e) {
+      await ctx.reply(`❌ status failed: ${String(e).slice(0, 200)}`);
+    }
+  });
+  bot.command('help', async (ctx) => {
+    await ctx.reply(convert([
+      `🤖 **Pump-catch commands**`,
+      ``,
+      `/open <CA> [usd] — track a TON token ($25 default). Wide plan: TP +50% half, TP +300% rest, trail 30%→20%, 24h hold.`,
+      `/close <CA|prefix> — full manual exit at market.`,
+      `/status — open positions with live ret.`,
+      ``,
+      `Exits fire only on TP / trailing breach / 24h timeout / manual close — never on chop.`,
+    ].join('\n')), { parse_mode: 'MarkdownV2', link_preview_options: { is_disabled: true } });
+  });
+  bot.command('start', async (ctx) => {
+    await ctx.reply(convert('👋 Send /help for commands. I track TON tokens with wide pump-catcher paper positions.'), { parse_mode: 'MarkdownV2' });
+  });
+
+  process.once('SIGTERM', () => {
+    console.log('SIGTERM, stopping Telegram polling');
+    void bot.stop().catch(() => undefined);
+  });
+  console.log('telegram command polling on (/open /close /status /help)');
+  const priceLoop = (async (): Promise<void> => {
+    for (;;) {
+      try {
+        await priceTick();
+      } catch (e) {
+        console.warn('tick failed', String(e).slice(0, 120));
+      }
+      await sleep(POLL_MS);
+    }
+  })();
+  await Promise.all([bot.start(), priceLoop]);
 }
 
 if (import.meta.main) {
