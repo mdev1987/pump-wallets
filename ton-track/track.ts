@@ -29,11 +29,13 @@ export const TON_CONFIG: EngineConfig = {
  */
 export const PUMP_CONFIG: EngineConfig = {
   ...TON_CONFIG,
-  tp1Pct: 0.5, // +50% take half
-  tp1Share: 0.5,
-  tp2Pct: 3.0, // +300% take the rest (moonbag runner)
-  trailPct: 0.3, // wide: survive -30% drawdowns
-  trailTightPct: 0.2, // after TP1: still wide, locks partial only
+  // Ladder: skim 20% at +100% and +200%, let 60% ride the pump.
+  tpLadder: [
+    { pct: 1.0, share: 0.2 },
+    { pct: 2.0, share: 0.2 },
+  ],
+  trailPct: 0.45, // wide: survive -45% drawdowns, exit only on real risk
+  trailTightPct: 0.45, // no tightening: wide throughout by design
   maxHoldSec: 24 * 3600,
 };
 

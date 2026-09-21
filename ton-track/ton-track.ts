@@ -312,7 +312,7 @@ async function main(): Promise<void> {
     pos.remainingQty = 0;
     pos.status = 'closed';
     pos.closeReason = 'manual /close';
-    pos.legs.push({ kind: 'timeout', priceUsd: q.priceUsd, qtyTokens: qty, pnlSol: legPnlSol(cfg, pos, qty, q.priceUsd), atMs: now });
+    pos.legs.push({ kind: 'timeout', label: 'manual /close', priceUsd: q.priceUsd, qtyTokens: qty, pnlSol: legPnlSol(cfg, pos, qty, q.priceUsd), atMs: now });
     creditLeg(pos, cfg, qty, q.priceUsd);
     const pnl = positionPnlSol(pos) - cfg.feeOpenSol;
     const sc = state.scenarios.find((s) => s.pos.id === pos.id)!;
@@ -409,11 +409,12 @@ async function main(): Promise<void> {
     await ctx.reply(convert([
       `🤖 **Pump-catch commands**`,
       ``,
-      `/open <CA> [usd] — track a TON token ($25 default). Wide plan: TP +50% half, TP +300% rest, trail 30%→20%, 24h hold.`,
+      `/open <CA> [usd] — track a TON token ($25 default). Pump plan below.`,
       `/close <CA|prefix> — full manual exit at market.`,
       `/status — open positions with live ret.`,
       ``,
-      `Exits fire only on TP / trailing breach / 24h timeout / manual close — never on chop.`,
+      `Pump plan: TP +100%×20%, +200%×20%, 60% runner. Trailing SL 45% (wide). 24h hold.`,
+      `Exits fire only on TP / trailing breach / timeout / manual — never on chop.`,
     ].join('\n')), { parse_mode: 'MarkdownV2', link_preview_options: { is_disabled: true } });
   });
   bot.command('start', async (ctx) => {

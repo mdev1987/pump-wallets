@@ -53,12 +53,35 @@ describe("bot commands", () => {
 });
 
 describe("pump-catcher config", () => {
-  test("wide plan: TP1 +50%, moonbag TP2, 24h hold, wide trail", async () => {
+  test("wide plan: skim 20% at +100%/+200%, 60% runner, 45% trail, 24h", async () => {
     const { PUMP_CONFIG } = await import("./track");
-    expect(PUMP_CONFIG.tp1Pct).toBe(0.5);
-    expect(PUMP_CONFIG.tp2Pct).toBe(3.0);
-    expect(PUMP_CONFIG.trailPct).toBe(0.3);
+    expect(PUMP_CONFIG.tpLadder).toEqual([{ pct: 1.0, share: 0.2 }, { pct: 2.0, share: 0.2 }]);
+    expect(PUMP_CONFIG.trailPct).toBe(0.45);
+    expect(PUMP_CONFIG.trailTightPct).toBe(0.45);
     expect(PUMP_CONFIG.maxHoldSec).toBe(24 * 3600);
+  });
+
+  test("pump runner survives chop that would stop a tight plan", async () => {
+    const { PUMP_CONFIG } = await import("./track");
+    const { openPosition, tickPosition } = await import("../paper-copy/engine");
+    const mk = (): Parameters<typeof openPosition>[1] => ({
+      id: "s", mint: "M", symbol: "T", wallet: "tracker", walletLabel: "x",
+      entryPriceUsd: 1.0, solUsdAtEntry: 1, atMs: 0, balanceBeforeSol: 1000,
+      buyers24h: 0, liqUsd: null, mcapUsd: null, ageHours: null, rugScore: null,
+    });
+    const p = openPosition(PUMP_CONFIG, mk());
+    // +110%: first skim fills, runner keeps 80%.
+    let ev = tickPosition(PUMP_CONFIG, p, 2.1, 1000);
+    expect(ev.partials).toHaveLength(1);
+    expect(ev.closed).toBe(false);
+    // Deep -30% drawdown from peak: wide 45% trail holds.
+    ev = tickPosition(PUMP_CONFIG, p, 1.47, 2000);
+    expect(ev.closed).toBe(false);
+    expect(p.status).toBe("open");
+    // -50% from peak: trailing stop finally fires.
+    ev = tickPosition(PUMP_CONFIG, p, 1.05, 3000);
+    expect(ev.closed).toBe(true);
+    expect(p.closeReason).toContain("trailing");
   });
 });
 

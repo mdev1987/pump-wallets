@@ -5,13 +5,19 @@
  * come out. All money math is in SOL; USD figures are display-only.
  */
 
+export type TpRung = {
+  /** Take-profit trigger, e.g. 1.0 = +100%. */
+  pct: number;
+  /** Fraction of the ORIGINAL position sold at this rung, e.g. 0.2. */
+  share: number;
+};
+
 export type EngineConfig = {
   posSizeSol: number;
-  tp1Pct: number; // e.g. 0.12 -> sell tp1Share at +12%
-  tp1Share: number; // e.g. 0.5
-  tp2Pct: number; // e.g. 0.4 -> sell rest at +40%
+  /** Ordered take-profit ladder (shares of original size; remainder rides). */
+  tpLadder: TpRung[];
   trailPct: number; // e.g. 0.15 -> trailing stop 15% under peak
-  trailTightPct: number; // trailing stop once TP1 has filled (locks the partial)
+  trailTightPct: number; // trailing stop once any TP has filled (locks partials)
   maxHoldSec: number;
   feeOpenSol: number;
   feeLegSol: number;
@@ -21,9 +27,10 @@ export type EngineConfig = {
 
 export const DEFAULT_CONFIG: EngineConfig = {
   posSizeSol: 0.05,
-  tp1Pct: 0.12,
-  tp1Share: 0.5,
-  tp2Pct: 0.4,
+  tpLadder: [
+    { pct: 0.12, share: 0.5 },
+    { pct: 0.4, share: 0.5 },
+  ],
   trailPct: 0.15,
   trailTightPct: 0.08,
   maxHoldSec: 2400,
@@ -32,7 +39,9 @@ export const DEFAULT_CONFIG: EngineConfig = {
 };
 
 export type ExitLeg = {
-  kind: 'tp1' | 'tp2' | 'trail' | 'timeout';
+  kind: 'tp' | 'trail' | 'timeout';
+  /** Human leg label, e.g. 'TP +100% (20%)'. */
+  label: string;
   priceUsd: number;
   qtyTokens: number;
   pnlSol: number;
@@ -52,6 +61,8 @@ export type Position = {
   peakPriceUsd: number;
   stopPriceUsd: number;
   tp1Done: boolean;
+  /** Per-rung fill flags aligned with cfg.tpLadder (self-migrates from tp1Done). */
+  tpDone: boolean[];
   openedAtMs: number;
   balanceBeforeSol: number;
   legs: ExitLeg[];
@@ -94,6 +105,7 @@ export function openPosition(
   return {
     ...rest,
     openedAtMs: atMs,
+    tpDone: [],
     qtyTokens,
     remainingQty: qtyTokens,
     peakPriceUsd: args.entryPriceUsd,
@@ -124,37 +136,70 @@ export function tickPosition(cfg: EngineConfig, pos: Position, priceUsd: number,
     pos.peakPriceUsd = priceUsd;
     // After the first partial, tighten the trail so a +20-30% runner that
     // fades keeps most of the move instead of round-tripping to the wide stop.
-    const trail = pos.tp1Done ? cfg.trailTightPct : cfg.trailPct;
+    const trail = (pos.tpDone?.some(Boolean) ?? pos.tp1Done) ? cfg.trailTightPct : cfg.trailPct;
     pos.stopPriceUsd = Math.max(pos.stopPriceUsd, priceUsd * (1 - trail));
   }
   const ret = priceUsd / pos.entryPriceUsd - 1;
 
-  if (!pos.tp1Done && ret >= cfg.tp1Pct) {
-    pos.tp1Done = true;
-    const qty = pos.remainingQty * cfg.tp1Share;
+  // Self-migrate pre-ladder positions (tp1Done era): first rung = old TP1.
+  if (pos.tpDone === undefined) pos.tpDone = [!!pos.tp1Done];
+  const anyFilled = pos.tpDone.some(Boolean);
+
+  for (let i = 0; i < cfg.tpLadder.length; i += 1) {
+    const rung = cfg.tpLadder[i]!;
+    if (pos.tpDone[i] || ret < rung.pct || pos.remainingQty <= 0) continue;
+    pos.tpDone[i] = true;
+    const qty = Math.min(pos.qtyTokens * rung.share, pos.remainingQty);
     pos.remainingQty -= qty;
-    partials.push({ kind: 'tp1', priceUsd, qtyTokens: qty, pnlSol: legPnlSol(cfg, pos, qty, priceUsd), atMs: nowMs });
+    partials.push({
+      kind: 'tp',
+      label: `TP +${(rung.pct * 100).toFixed(0)}% (${(rung.share * 100).toFixed(0)}%)`,
+      priceUsd,
+      qtyTokens: qty,
+      pnlSol: legPnlSol(cfg, pos, qty, priceUsd),
+      atMs: nowMs,
+    });
     // Lock the partial immediately: tighten the stop to the fill price regime.
     pos.stopPriceUsd = Math.max(pos.stopPriceUsd, priceUsd * (1 - cfg.trailTightPct));
   }
-
   let closed = false;
   let closeReason: string | null = null;
-  const closeRest = (kind: ExitLeg['kind'], reason: string): void => {
+  const closeRest = (kind: ExitLeg['kind'], label: string, reason: string): void => {
     const qty = pos.remainingQty;
     pos.remainingQty = 0;
     pos.status = 'closed';
     pos.closeReason = reason;
-    pos.legs.push({ kind, priceUsd, qtyTokens: qty, pnlSol: legPnlSol(cfg, pos, qty, priceUsd), atMs: nowMs });
+    pos.legs.push({ kind, label, priceUsd, qtyTokens: qty, pnlSol: legPnlSol(cfg, pos, qty, priceUsd), atMs: nowMs });
     closed = true;
     closeReason = reason;
   };
 
-  if (ret >= cfg.tp2Pct && pos.remainingQty > 0) closeRest('tp2', `TP2 +${(cfg.tp2Pct * 100).toFixed(0)}%`);
-  else if (priceUsd <= pos.stopPriceUsd && pos.remainingQty > 0) {
-    closeRest('trail', `trailing stop (${(cfg.trailPct * 100).toFixed(0)}% under peak)`);
-  } else if (cfg.maxHoldSec > 0 && nowMs - pos.openedAtMs >= cfg.maxHoldSec * 1000 && pos.remainingQty > 0) {
-    closeRest('timeout', `max hold ${(cfg.maxHoldSec / 60).toFixed(0)}m`);
+  // Ladder exhausted (rung shares sum to ~all): convert the last fill of
+  // this tick into the closing leg so its size and PnL are not lost to the
+  // emptied remainder. Otherwise the remainder rides as a runner.
+  const dust = pos.qtyTokens * 0.001;
+  if (pos.remainingQty <= dust && pos.tpDone.some(Boolean)) {
+    const lastFill = partials.at(-1);
+    const lastIdx = pos.tpDone.lastIndexOf(true);
+    const lastRung = cfg.tpLadder[lastIdx];
+    const label = lastRung ? `TP +${(lastRung.pct * 100).toFixed(0)}% (ladder complete)` : 'ladder complete';
+    if (lastFill) {
+      partials.pop();
+      pos.remainingQty = lastFill.qtyTokens;
+      pos.status = 'closed';
+      pos.closeReason = label;
+      pos.legs.push({ ...lastFill, label });
+      closed = true;
+      closeReason = label;
+    } else {
+      closeRest('tp', label, label);
+    }
+  } else if (pos.remainingQty > 0) {
+    if (priceUsd <= pos.stopPriceUsd) {
+      closeRest('trail', 'trailing stop', `trailing stop (${(cfg.trailPct * 100).toFixed(0)}% under peak)`);
+    } else if (cfg.maxHoldSec > 0 && nowMs - pos.openedAtMs >= cfg.maxHoldSec * 1000) {
+      closeRest('timeout', 'timeout', `max hold ${(cfg.maxHoldSec / 60).toFixed(0)}m`);
+    }
   }
   return { partials, closed, closeReason };
 }
@@ -230,10 +275,9 @@ export function openReport(cfg: EngineConfig, pos: Position, balanceAfterSol: nu
     `👥 Tracked buyers (24h): **${pos.buyers24h}**`,
     ``,
     `🛡️ **Risk plan**`,
-    `• 🎯 TP1: +${(cfg.tp1Pct * 100).toFixed(0)}% sell ${(cfg.tp1Share * 100).toFixed(0)}%`,
-    `• 🎯 TP2: +${(cfg.tp2Pct * 100).toFixed(0)}% sell rest`,
+    ...cfg.tpLadder.map((r, i) => `• 🎯 TP${i + 1}: +${(r.pct * 100).toFixed(0)}% sell ${(r.share * 100).toFixed(0)}%`),
     `• 📉 Trailing SL: ${(cfg.trailPct * 100).toFixed(0)}% under peak (starts ${fmtUsd(pos.stopPriceUsd)})`,
-    `• ⏱️ Max hold: ${(cfg.maxHoldSec / 60).toFixed(0)}m`,
+    `• ⏱️ Max hold: ${cfg.maxHoldSec <= 0 ? 'off' : cfg.maxHoldSec >= 3600 ? `${(cfg.maxHoldSec / 3600).toFixed(cfg.maxHoldSec % 3600 === 0 ? 0 : 1)}h` : `${(cfg.maxHoldSec / 60).toFixed(0)}m`}`,
     ``,
     `📊 **Token checks**`,
     `• Liquidity: ${fmtUsd(pos.liqUsd)} | MCap: ${fmtUsd(pos.mcapUsd)} | Age: ${ageStr(pos.ageHours)}`,
@@ -250,7 +294,7 @@ export function partialReport(cfg: EngineConfig, pos: Position, leg: ExitLeg, so
   return [
     `🔔 **PARTIAL TP** — $${pos.symbol}`,
     ``,
-    `• Sold 50% at ${fmtUsd(leg.priceUsd)} (${fmtPct(leg.priceUsd / pos.entryPriceUsd - 1)})`,
+    `• Sold ${(leg.qtyTokens / pos.qtyTokens * 100).toFixed(0)}% at ${fmtUsd(leg.priceUsd)} (${fmtPct(leg.priceUsd / pos.entryPriceUsd - 1)})`,
     `• Realized: **${leg.pnlSol >= 0 ? '+' : ''}${leg.pnlSol.toFixed(5)} ${unitOf(cfg)}**${usd}`,
     `• Runner left: ${(pos.remainingQty).toFixed(2)} tokens | stop now ${fmtUsd(pos.stopPriceUsd)}`,
     `🆔 \`${pos.id}\``,
@@ -271,7 +315,7 @@ export function closeReport(
   const winrate = stats.closed > 0 ? `${((stats.wins / stats.closed) * 100).toFixed(1)}% (${stats.wins}/${stats.closed})` : 'n/a';
   const usd = solUsd ? ` (~${fmtUsd(pnl * solUsd)})` : '';
   const legs = pos.legs
-    .map((l) => `• ${l.kind.toUpperCase()}: ${fmtUsd(l.priceUsd)} (${fmtPct(l.priceUsd / pos.entryPriceUsd - 1)}) → ${l.pnlSol >= 0 ? '+' : ''}${l.pnlSol.toFixed(5)} ${unitOf(cfg)}`)
+    .map((l) => `• ${l.label}: ${fmtUsd(l.priceUsd)} (${fmtPct(l.priceUsd / pos.entryPriceUsd - 1)}) → ${l.pnlSol >= 0 ? '+' : ''}${l.pnlSol.toFixed(5)} ${unitOf(cfg)}`)
     .join('\n');
   return [
     `${icon} **PAPER CLOSE** — $${pos.symbol} — ${pos.closeReason}`,
@@ -298,7 +342,7 @@ export function startupReport(cfg: EngineConfig, tracked: number, balanceSol: nu
     `🚀 **Paper-copy reporter live**`,
     ``,
     `👀 Tracking **${tracked}** leader wallets (5-min sweep)`,
-    `💰 Size **${cfg.posSizeSol} ${cfg.unitLabel ?? 'SOL'}**/pos | TP +${(cfg.tp1Pct * 100).toFixed(0)}%/½ +${(cfg.tp2Pct * 100).toFixed(0)}% | Trail ${(cfg.trailPct * 100).toFixed(0)}% | Hold ≤${(cfg.maxHoldSec / 60).toFixed(0)}m`,
+    `💰 Size **${cfg.posSizeSol} ${cfg.unitLabel ?? 'SOL'}**/pos | TP ${cfg.tpLadder.map((r) => `+${(r.pct * 100).toFixed(0)}%×${(r.share * 100).toFixed(0)}%`).join(' ')} | Trail ${(cfg.trailPct * 100).toFixed(0)}% | Hold ${cfg.maxHoldSec <= 0 ? 'off' : `≤${(cfg.maxHoldSec / 3600).toFixed(1)}h`}`,
     `💼 Paper balance: **${balanceSol.toFixed(4)} ${cfg.unitLabel ?? 'SOL'}**`,
     `📝 Reports: open / partial-TP / close with PnL, winrate, balances`,
   ].join('\n');
