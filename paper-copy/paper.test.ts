@@ -87,6 +87,25 @@ describe("two-tier sweep delta", () => {
   });
 });
 
+describe("ledger audit", () => {
+  test("passes clean books, anchors legacy gap once, trips on new drift", async () => {
+    const { auditLedger, ledgerExpected } = await import("./engine");
+    const base = { startBalance: 10, posSize: 0.05, feeOpen: 0.0002, feeLeg: 0.0001 };
+    const pos = {
+      qtyTokens: 100, entryPriceUsd: 1, sizeSol: 0.05, feeOpenSol: 0.0002, feeLegSol: 0.0001,
+      legs: [{ qtyTokens: 50, priceUsd: 1.2, pnlSol: 0.0099 }],
+    };
+    const clean = 10 - 0.0502 + (0.5 * 0.05 * 1.2 - 0.0001);
+    expect(auditLedger({ ...base, balance: clean, positions: [pos] })).toBeNull();
+    expect(ledgerExpected({ ...base, positions: [pos] })).toBeCloseTo(clean, 9);
+    // Legacy books carry unrecorded credits: plain audit trips...
+    expect(auditLedger({ ...base, balance: clean + 1.5, positions: [pos] })).not.toBeNull();
+    // ...but the same books pass with the anchor, and new drift still trips.
+    expect(auditLedger({ ...base, balance: clean + 1.5, positions: [pos], legacyOffset: 1.5 })).toBeNull();
+    expect(auditLedger({ ...base, balance: clean + 1.6, positions: [pos], legacyOffset: 1.5 })).not.toBeNull();
+  });
+});
+
 describe("paper engine lifecycle", () => {
   test("ladder fills rung by rung, closes when exhausted", () => {
     const p = mkPos(1.0);

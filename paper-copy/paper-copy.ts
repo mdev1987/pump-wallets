@@ -14,6 +14,7 @@ import {
   DEFAULT_CONFIG,
   assessRug,
   auditLedger,
+  ledgerExpected,
   momentumBlocked,
   sigsDelta,
   walletDayAllowed,
@@ -68,6 +69,8 @@ type State = {
   mintBuyers: Record<string, { wallets: string[]; sinceMs: number }>;
   /** wallet -> {UTC day, opens today}; bounds one actor's share of flow. */
   opensToday: Record<string, { day: string; count: number }>;
+  /** One-time ledger anchor for pre-audit unrecorded credits (see engine). */
+  auditOffset?: number;
 };
 
 async function loadEnvFile(path: string): Promise<Record<string, string>> {
@@ -534,14 +537,26 @@ async function main(): Promise<void> {
       const paused = Date.now() < breakerUntilMs;
       const open = state.positions.filter((p) => p.status === 'open').length;
       // Ledger self-audit every sweep: recomputed balance must match.
-      const problem = auditLedger({
+      const auditArgs = {
         startBalance: START_BALANCE_SOL,
         balance: state.balanceSol,
         positions: state.positions,
         posSize: cfg.posSizeSol,
         feeOpen: cfg.feeOpenSol,
         feeLeg: cfg.feeLegSol,
-      });
+        legacyOffset: state.auditOffset,
+      };
+      let problem = auditLedger(auditArgs);
+      if (problem && problem.startsWith('balance drift') && state.auditOffset === undefined) {
+        // First run against pre-audit history: anchor once to the current
+        // ledger (unrecorded TP1 partials of the bug era), then watch for
+        // NEW drift from here. The anchor value itself is the disclosure.
+        const anchored = state.balanceSol - ledgerExpected(auditArgs);
+        state.auditOffset = anchored;
+        await saveState(state);
+        console.warn(`LEDGER AUDIT: anchoring legacy offset ${anchored >= 0 ? '+' : ''}${anchored.toFixed(4)} (pre-audit unrecorded partials); watching for new drift`);
+        problem = auditLedger({ ...auditArgs, legacyOffset: anchored });
+      }
       if (problem) console.warn(`LEDGER AUDIT: ${problem}`);
       // Heartbeat every sweep: proves liveness even when the market is quiet
       // (no entries/exits), which the log-freshness health check needs.

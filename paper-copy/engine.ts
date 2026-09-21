@@ -302,24 +302,25 @@ export function walletDayRecord(budget: DailyBudget, wallet: string, nowMs: numb
  * against the running balance. Returns a human-readable problem or null.
  * Catches accounting regressions (e.g. credited-but-unrecorded legs) early.
  */
-export function auditLedger(args: {
-  startBalance: number;
-  balance: number;
-  positions: Array<{
-    qtyTokens: number;
-    entryPriceUsd: number;
-    sizeSol?: number;
-    feeOpenSol?: number;
-    feeLegSol?: number;
-    legs: Array<{ qtyTokens: number; priceUsd: number; pnlSol: number }>;
-  }>;
-  posSize: number;
-  feeOpen: number;
-  feeLeg: number;
-}): string | null {
-  if (!Number.isFinite(args.balance) || args.balance < 0 || args.balance > args.startBalance * 10) {
-    return `balance out of range: ${args.balance}`;
-  }
+export type LedgerPosition = {
+  qtyTokens: number;
+  entryPriceUsd: number;
+  sizeSol?: number;
+  feeOpenSol?: number;
+  feeLegSol?: number;
+  legs: Array<{ qtyTokens: number; priceUsd: number; pnlSol: number }>;
+};
+
+/** Recompute the expected balance from persisted legs (NaN on bad data). */
+export function ledgerExpected(
+  args: {
+    startBalance: number;
+    positions: LedgerPosition[];
+    posSize: number;
+    feeOpen: number;
+    feeLeg: number;
+  },
+): number {
   let expected = args.startBalance;
   for (const p of args.positions) {
     // Prefer the per-position snapshot so later config changes can't rewrite
@@ -330,12 +331,34 @@ export function auditLedger(args: {
     expected -= size + feeO;
     for (const l of p.legs) {
       if (!Number.isFinite(l.pnlSol) || !Number.isFinite(l.qtyTokens) || !Number.isFinite(l.priceUsd)) {
-        return 'non-finite leg value in ledger';
+        return NaN;
       }
       const share = p.qtyTokens > 0 ? l.qtyTokens / p.qtyTokens : 0;
       expected += share * size * (l.priceUsd / p.entryPriceUsd) - feeL;
     }
   }
+  return expected;
+}
+
+export function auditLedger(args: {
+  startBalance: number;
+  balance: number;
+  positions: LedgerPosition[];
+  posSize: number;
+  feeOpen: number;
+  feeLeg: number;
+  /**
+   * One-time anchor for pre-audit history whose credits were never recorded
+   * (e.g. partial legs credited before persistence existed). New drift past
+   * the anchor still trips the audit.
+   */
+  legacyOffset?: number;
+}): string | null {
+  if (!Number.isFinite(args.balance) || args.balance < 0 || args.balance > args.startBalance * 10) {
+    return `balance out of range: ${args.balance}`;
+  }
+  const expected = ledgerExpected(args) + (args.legacyOffset ?? 0);
+  if (!Number.isFinite(expected)) return 'non-finite leg value in ledger';
   if (Math.abs(expected - args.balance) > 0.001) {
     return `balance drift: ledger ${args.balance.toFixed(4)} vs recomputed ${expected.toFixed(4)}`;
   }
