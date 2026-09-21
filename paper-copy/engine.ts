@@ -63,6 +63,10 @@ export type Position = {
   tp1Done: boolean;
   /** Per-rung fill flags aligned with cfg.tpLadder (self-migrates from tp1Done). */
   tpDone: boolean[];
+  /** Notional snapshot at open so later config changes can't rewrite history. */
+  sizeSol: number;
+  feeOpenSol: number;
+  feeLegSol: number;
   openedAtMs: number;
   balanceBeforeSol: number;
   legs: ExitLeg[];
@@ -106,6 +110,9 @@ export function openPosition(
     ...rest,
     openedAtMs: atMs,
     tpDone: [],
+    sizeSol: cfg.posSizeSol,
+    feeOpenSol: cfg.feeOpenSol,
+    feeLegSol: cfg.feeLegSol,
     qtyTokens,
     remainingQty: qtyTokens,
     peakPriceUsd: args.entryPriceUsd,
@@ -241,6 +248,84 @@ export function assessRug(summary: unknown): RugAssessment {
 
 export function unitOf(cfg: EngineConfig): string {
   return cfg.unitLabel ?? 'SOL';
+}
+
+/** UTC day key for per-wallet daily budgeting. */
+export function dayKey(ms: number): string {
+  return new Date(ms).toISOString().slice(0, 10);
+}
+
+/**
+ * Momentum-chase veto: with minutes of copy latency behind the leader, buying
+ * into an already-vertical 5-minute print means buying their top. Skip entries
+ * already up more than maxPct in the last 5 minutes; null/unknown passes.
+ */
+export function momentumBlocked(m5ChangePct: number | null, maxPct = 20): boolean {
+  return m5ChangePct !== null && Number.isFinite(m5ChangePct) && m5ChangePct > maxPct;
+}
+
+export type DailyBudget = Record<string, { day: string; count: number }>;
+
+/** Per-wallet daily open budget check (diversifies flow across leaders). */
+export function walletDayAllowed(budget: DailyBudget, wallet: string, nowMs: number, max: number): boolean {
+  const entry = budget[wallet];
+  if (!entry || entry.day !== dayKey(nowMs)) return true;
+  return entry.count < max;
+}
+
+/** Record one open against the wallet's daily budget. */
+export function walletDayRecord(budget: DailyBudget, wallet: string, nowMs: number): void {
+  const entry = budget[wallet];
+  if (!entry || entry.day !== dayKey(nowMs)) {
+    budget[wallet] = { day: dayKey(nowMs), count: 1 };
+  } else {
+    entry.count += 1;
+  }
+}
+
+/**
+ * Ledger self-audit: recompute lifetime PnL from persisted legs and compare
+ * against the running balance. Returns a human-readable problem or null.
+ * Catches accounting regressions (e.g. credited-but-unrecorded legs) early.
+ */
+export function auditLedger(args: {
+  startBalance: number;
+  balance: number;
+  positions: Array<{
+    qtyTokens: number;
+    entryPriceUsd: number;
+    sizeSol?: number;
+    feeOpenSol?: number;
+    feeLegSol?: number;
+    legs: Array<{ qtyTokens: number; priceUsd: number; pnlSol: number }>;
+  }>;
+  posSize: number;
+  feeOpen: number;
+  feeLeg: number;
+}): string | null {
+  if (!Number.isFinite(args.balance) || args.balance < 0 || args.balance > args.startBalance * 10) {
+    return `balance out of range: ${args.balance}`;
+  }
+  let expected = args.startBalance;
+  for (const p of args.positions) {
+    // Prefer the per-position snapshot so later config changes can't rewrite
+    // history; fall back to current cfg for pre-snapshot positions.
+    const size = p.sizeSol ?? args.posSize;
+    const feeO = p.feeOpenSol ?? args.feeOpen;
+    const feeL = p.feeLegSol ?? args.feeLeg;
+    expected -= size + feeO;
+    for (const l of p.legs) {
+      if (!Number.isFinite(l.pnlSol) || !Number.isFinite(l.qtyTokens) || !Number.isFinite(l.priceUsd)) {
+        return 'non-finite leg value in ledger';
+      }
+      const share = p.qtyTokens > 0 ? l.qtyTokens / p.qtyTokens : 0;
+      expected += share * size * (l.priceUsd / p.entryPriceUsd) - feeL;
+    }
+  }
+  if (Math.abs(expected - args.balance) > 0.001) {
+    return `balance drift: ledger ${args.balance.toFixed(4)} vs recomputed ${expected.toFixed(4)}`;
+  }
+  return null;
 }
 
 export function fmtUsd(v: number | null): string {

@@ -39,6 +39,43 @@ function mkPos(entry = 1.0): Position {
   });
 }
 
+describe("entry gates", () => {
+  test("momentum veto blocks vertical m5 prints, passes the rest", async () => {
+    const { momentumBlocked } = await import("./engine");
+    expect(momentumBlocked(35)).toBe(true);
+    expect(momentumBlocked(20)).toBe(false);
+    expect(momentumBlocked(-50)).toBe(false);
+    expect(momentumBlocked(null)).toBe(false);
+    expect(momentumBlocked(NaN)).toBe(false);
+  });
+
+  test("wallet daily budget caps one actor at N opens/day", async () => {
+    const { walletDayAllowed, walletDayRecord } = await import("./engine");
+    const b = {};
+    const day = Date.parse("2026-09-21T12:00:00Z");
+    expect(walletDayAllowed(b, "W", day, 3)).toBe(true);
+    walletDayRecord(b, "W", day);
+    walletDayRecord(b, "W", day);
+    walletDayRecord(b, "W", day);
+    expect(walletDayAllowed(b, "W", day, 3)).toBe(false);
+    expect(walletDayAllowed(b, "X", day, 3)).toBe(true);
+    // Next UTC day resets.
+    expect(walletDayAllowed(b, "W", day + 86400_000, 3)).toBe(true);
+  });
+
+  test("ledger audit catches drift and passes clean books", async () => {
+    const { auditLedger } = await import("./engine");
+    const pos = {
+      qtyTokens: 100, entryPriceUsd: 1, sizeSol: 0.05, feeOpenSol: 0.0002, feeLegSol: 0.0001,
+      legs: [{ qtyTokens: 50, priceUsd: 1.2, pnlSol: 0.0099 }],
+    };
+    // balance = 10 - 0.0502 + (0.5*0.05*1.2 - 0.0001) = 10 - 0.0502 + 0.0299
+    expect(auditLedger({ startBalance: 10, balance: 9.9797, positions: [pos], posSize: 0.05, feeOpen: 0.0002, feeLeg: 0.0001 })).toBeNull();
+    expect(auditLedger({ startBalance: 10, balance: 9.5, positions: [pos], posSize: 0.05, feeOpen: 0.0002, feeLeg: 0.0001 })).not.toBeNull();
+    expect(auditLedger({ startBalance: 10, balance: NaN, positions: [], posSize: 0.05, feeOpen: 0.0002, feeLeg: 0.0001 })).not.toBeNull();
+  });
+});
+
 describe("paper engine lifecycle", () => {
   test("ladder fills rung by rung, closes when exhausted", () => {
     const p = mkPos(1.0);

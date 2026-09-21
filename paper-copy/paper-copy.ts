@@ -13,6 +13,10 @@ import { readFile, writeFile, rename, mkdir } from 'node:fs/promises';
 import {
   DEFAULT_CONFIG,
   assessRug,
+  auditLedger,
+  momentumBlocked,
+  walletDayAllowed,
+  walletDayRecord,
   openPosition,
   tickPosition,
   positionPnlSol,
@@ -42,6 +46,16 @@ const MAX_MCAP_USD = 3_000_000;
 const MAX_AGE_HOURS = 72;
 const RUG_MAX_SCORE = 50;
 const START_BALANCE_SOL = 10;
+// kEFiAX-class hyperactivity did 58/108 paper trades at -0.089 total: cap how
+// many positions one wallet may open per UTC day to force diversification.
+const MAX_OPENS_PER_WALLET_PER_DAY = 3;
+// With minutes of copy latency behind the leader, buying into an already
+// vertical 5-minute print means buying their top.
+const MOMENTUM_MAX_M5_PCT = 20;
+// Circuit breaker: this many Helius wallet errors in one sweep pauses NEW
+// entries for 30 min (position management is never paused).
+const BREAKER_SWEEP_ERRORS = 8;
+const BREAKER_PAUSE_MS = 30 * 60_000;
 
 type State = {
   balanceSol: number;
@@ -49,8 +63,10 @@ type State = {
   closed: Array<{ id: string; mint: string; symbol: string; pnlSol: number; win: boolean; atMs: number }>;
   lastSig: Record<string, string>;
   cooldownUntil: Record<string, number>;
-  /** mint -> {wallets seen buying, first-seen ms}; pruned past 24h. Feeds the buyers24h count. */
+  /** mint -> {wallets seen buying, first-seen ms}; prunes as it goes. Feeds the buyers24h count. */
   mintBuyers: Record<string, { wallets: string[]; sinceMs: number }>;
+  /** wallet -> {UTC day, opens today}; bounds one actor's share of flow. */
+  opensToday: Record<string, { day: string; count: number }>;
 };
 
 async function loadEnvFile(path: string): Promise<Record<string, string>> {
@@ -70,9 +86,10 @@ async function loadState(): Promise<State> {
   try {
     const s = JSON.parse(await readFile(STATE_PATH, 'utf8')) as State;
     s.mintBuyers ??= {};
+    s.opensToday ??= {};
     return s;
   } catch {
-    return { balanceSol: START_BALANCE_SOL, positions: [], closed: [], lastSig: {}, cooldownUntil: {}, mintBuyers: {} };
+    return { balanceSol: START_BALANCE_SOL, positions: [], closed: [], lastSig: {}, cooldownUntil: {}, mintBuyers: {}, opensToday: {} };
   }
 }
 
@@ -92,7 +109,13 @@ async function saveState(s: State): Promise<void> {
   const tmp = `${STATE_PATH}.tmp`;
   await writeFile(tmp, JSON.stringify(s, null, 2));
   await rename(tmp, STATE_PATH);
+  // Rolling backup: a corrupt/partial state write must never be the only copy.
+  try {
+    await writeFile(`${STATE_PATH}.bak`, JSON.stringify(s));
+  } catch { /* backup is best-effort */ }
 }
+
+
 
 async function fetchJson(url: string, init?: RequestInit, timeoutMs = HTTP_TIMEOUT_MS): Promise<unknown> {
   const c = new AbortController();
@@ -151,7 +174,7 @@ async function loadTracked(): Promise<Tracked[]> {
     .slice(0, TRACK_TOP_N);
 }
 
-type DexInfo = { priceUsd: number | null; liqUsd: number | null; mcapUsd: number | null; ageHours: number | null; symbol: string };
+type DexInfo = { priceUsd: number | null; liqUsd: number | null; mcapUsd: number | null; ageHours: number | null; symbol: string; chgM5: number | null };
 async function dexBatch(mints: string[]): Promise<Map<string, DexInfo>> {
   const out = new Map<string, DexInfo>();
   if (!mints.length) return out;
@@ -166,12 +189,14 @@ async function dexBatch(mints: string[]): Promise<Map<string, DexInfo>> {
       if (prev && (prev.liqUsd ?? 0) >= liq) continue;
     }
     const created = p['pairCreatedAt'] as number | undefined;
+    const chg = (p['priceChange'] as Record<string, unknown> | undefined) ?? {};
     out.set(addr, {
       priceUsd: p['priceUsd'] === null ? null : Number(p['priceUsd']),
       liqUsd: Number((p['liquidity'] as Record<string, unknown> | undefined)?.['usd'] ?? NaN) || null,
       mcapUsd: (p['marketCap'] as number | undefined) ?? null,
       ageHours: created ? (Date.now() - created) / 3600_000 : null,
       symbol: base?.['symbol'] ?? addr.slice(0, 8),
+      chgM5: typeof chg['m5'] === 'number' ? (chg['m5'] as number) : null,
     });
   }
   return out;
@@ -314,13 +339,22 @@ async function main(): Promise<void> {
     if (dirty) await saveState(state);
   };
 
-  const sweep = async (): Promise<number> => {
+  const sweepWithErrors = async (): Promise<{ fresh: number; errors: number }> => {
     let fresh = 0;
+    let errors = 0;
+    // breakerUntilMs is declared below alongside sweepLoop but initialized
+    // before any sweep runs, so this read is safe at call time.
+    const entriesPaused = Date.now() < breakerUntilMs;
     for (const t of tracked) {
       try {
         const { buys, newestSig } = await recentBuys(pool, t.wallet, state.lastSig[t.wallet] ?? null);
         if (newestSig) state.lastSig[t.wallet] = newestSig;
         fresh += buys.length;
+        if (entriesPaused) {
+          await saveState(state);
+          await sleep(WALLET_SPACING_MS);
+          continue;
+        }
         for (const b of buys) {
           if (state.positions.some((p) => p.status === 'open' && p.mint === b.mint)) continue;
           // One open position per wallet: kEFiAX-class hyperactivity would
@@ -331,8 +365,16 @@ async function main(): Promise<void> {
           }
           if (state.positions.filter((p) => p.status === 'open').length >= MAX_OPEN_POSITIONS) break;
           if ((state.cooldownUntil[`${t.wallet}:${b.mint}`] ?? 0) > Date.now()) continue;
+          if (!walletDayAllowed(state.opensToday, t.wallet, Date.now(), MAX_OPENS_PER_WALLET_PER_DAY)) {
+            console.log(`skip ${b.mint.slice(0, 8)}: wallet daily budget exhausted`);
+            continue;
+          }
           const info = (await dexBatch([b.mint])).get(b.mint);
           if (!info?.priceUsd) continue;
+          if (momentumBlocked(info.chgM5, MOMENTUM_MAX_M5_PCT)) {
+            console.log(`skip ${b.mint.slice(0, 8)}: vertical m5 (+${info.chgM5}%), not chasing`);
+            continue;
+          }
           if ((info.liqUsd ?? 0) < MIN_LIQ_USD) continue;
           if ((info.mcapUsd ?? Infinity) > MAX_MCAP_USD) continue;
           if ((info.ageHours ?? 0) > MAX_AGE_HOURS) continue;
@@ -379,16 +421,18 @@ async function main(): Promise<void> {
           state.balanceSol -= cfg.posSizeSol + cfg.feeOpenSol;
           state.positions.push(pos);
           state.cooldownUntil[`${t.wallet}:${b.mint}`] = Date.now() + ENTRY_COOLDOWN_MS;
+          walletDayRecord(state.opensToday, t.wallet, Date.now());
           await saveState(state);
           await send(openReport(cfg, pos, state.balanceSol, solUsdCache));
         }
         await saveState(state);
       } catch (e) {
+        errors += 1;
         console.warn(`sweep ${t.wallet.slice(0, 8)} failed`, String(e).slice(0, 120));
       }
       await sleep(WALLET_SPACING_MS);
     }
-    return fresh;
+    return { fresh, errors };
   };
 
   // Price ticks every 30s idle, 15s while positions are open (TP levels live
@@ -400,20 +444,44 @@ async function main(): Promise<void> {
       await sleep(hasOpen ? 15_000 : PRICE_TICK_MS);
     }
   };
+  // consecutive sweeps hitting the breaker threshold pause NEW entries
+  // (position management is never paused).
+  let breakerUntilMs = 0;
   const sweepLoop = async (): Promise<void> => {
     for (;;) {
       solUsdCache = (await solUsd().catch(() => solUsdCache)) ?? solUsdCache;
       const t0 = Date.now();
       let fresh = 0;
+      let heliusErrors = 0;
       try {
-        fresh = await sweep();
+        const r = await sweepWithErrors();
+        fresh = r.fresh;
+        heliusErrors = r.errors;
       } catch (e) {
         console.warn('sweep', String(e).slice(0, 120));
+        heliusErrors = TRACK_TOP_N;
       }
+      if (heliusErrors >= BREAKER_SWEEP_ERRORS) {
+        breakerUntilMs = Date.now() + BREAKER_PAUSE_MS;
+        console.warn(`CIRCUIT BREAKER: ${heliusErrors} Helius errors, new entries paused 30m (management continues)`);
+      } else if (heliusErrors === 0) {
+        breakerUntilMs = 0;
+      }
+      const paused = Date.now() < breakerUntilMs;
       const open = state.positions.filter((p) => p.status === 'open').length;
+      // Ledger self-audit every sweep: recomputed balance must match.
+      const problem = auditLedger({
+        startBalance: START_BALANCE_SOL,
+        balance: state.balanceSol,
+        positions: state.positions,
+        posSize: cfg.posSizeSol,
+        feeOpen: cfg.feeOpenSol,
+        feeLeg: cfg.feeLegSol,
+      });
+      if (problem) console.warn(`LEDGER AUDIT: ${problem}`);
       // Heartbeat every sweep: proves liveness even when the market is quiet
       // (no entries/exits), which the log-freshness health check needs.
-      console.log(`sweep complete: ${tracked.length} wallets, ${fresh} fresh buys, ${open} open, balance ${state.balanceSol.toFixed(4)} SOL, ${((Date.now() - t0) / 1000).toFixed(0)}s`);
+      console.log(`sweep complete: ${tracked.length} wallets, ${fresh} fresh buys, ${open} open, balance ${state.balanceSol.toFixed(4)} SOL, ${((Date.now() - t0) / 1000).toFixed(0)}s${paused ? ' BREAKER-PAUSED' : ''}${problem ? ' AUDIT-FAIL' : ''}`);
       await sleep(SWEEP_INTERVAL_MS);
     }
   };
