@@ -22,7 +22,7 @@ name = "pump-wallets"
 # DuckDB/response.json concurrently (seen in logs 03:03:07 + 03:03:41 overlap).
 # One-shot batch: exits 0 after DeBot+Helius+DuckDB run. on-failure (not always)
 # so a clean run does NOT hot-loop DeBot/Helius; cron_restart schedules live scans.
-command = "/bin/sh -c '/usr/bin/flock -n --conflict-exit-code 99 /tmp/pump-wallets.lock /home/mdev/.bun/bin/bun --smol run get_pump_wallets.ts || test $? -eq 99'"
+command = "/bin/sh -c '/usr/bin/flock -n --conflict-exit-code 99 /tmp/pump-wallets.lock /home/mdev/.bun/bin/bun --smol run get_pump_wallets.ts || { code=$?; if [ $code -eq 99 ]; then echo \"$(date -u +%FT%TZ) | SKIP | previous run still holding lock\" >> /home/mdev/Programming/pump-wallets-final-v11-fixed/logs/cron-skips.log; exit 0; else exit $code; fi; }'"
 cwd = "/home/mdev/Programming/pump-wallets-final-v11-fixed"
 restart_policy = "on-failure"
 max_restarts = 20

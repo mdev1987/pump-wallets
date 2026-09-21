@@ -503,6 +503,9 @@ async function main(): Promise<void> {
     console.log(`            ${config.logDir}/debot/signals.csv`);
   } finally {
     db.close();
+    // Proves the process actually exited (vs hanging post-Finished with the
+    // flock held, which silently starves all later cron ticks).
+    await rootLogger.info('Research database closed; run exiting');
   }
 }
 
