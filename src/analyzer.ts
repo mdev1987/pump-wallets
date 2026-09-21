@@ -1,4 +1,5 @@
 import type { Config } from "./config";
+import { RESEARCH_VERSION } from "./version";
 
 /**
  * Core pump-wallet analysis engine.
@@ -346,7 +347,7 @@ export type TradeFlowIndex = {
 };
 
 export type AnalysisResponse = {
-  version: 11;
+  version: typeof RESEARCH_VERSION;
   token: string;
   scannedAt: string;
   /**
@@ -2155,7 +2156,7 @@ export function analyzeToken(
 
 
   return {
-    version: 11,
+    version: RESEARCH_VERSION,
     token: tokenAddress,
     scannedAt: new Date().toISOString(),
     runId,

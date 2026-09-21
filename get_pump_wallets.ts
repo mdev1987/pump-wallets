@@ -6,6 +6,9 @@ import {
 } from './src/analyzer';
 import { loadConfig, type Config } from './src/config';
 import { exportGlobalCsv, persistToken, recordTokenFailure, ResearchDb, type TokenScanStatus } from './src/duckdb';
+import { candidatesForToken, readTopPnlCandidates, type WalletCandidate } from './src/candidates';
+import { snapshotCandidate } from './src/candidate_store';
+import { RESEARCH_VERSION } from './src/version';
 import { fetchTransactions } from './src/helius';
 import { Logger } from './src/logger';
 import { objectsToCsv } from './src/csv';
@@ -20,13 +23,15 @@ import { DeBotFileLogger } from './src/debot_logger';
 
 const SOLANA_MINT_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 
-type TokenSource = 'cli' | 'debot' | 'cli+debot';
+type TokenSourcePart = 'cli' | 'debot' | 'candidate';
+type TokenSource = string;
 
 type IntegratedResponse = AnalysisResponse & {
   integration: {
     scanSource: TokenSource;
     debotObservedAt: string | null;
     debotSignal: DeBotTrendingSignal | null;
+    topPnlCandidates: WalletCandidate[];
   };
 };
 
@@ -40,19 +45,29 @@ Usage:
   bun run get_pump_wallets.ts --token <TOKEN_CA_1> --token <TOKEN_CA_2>
   bun run get_pump_wallets.ts --token ./tokenlist.txt
   bun run get_pump_wallets.ts --token ./tokenlist.txt --token <TOKEN_CA>
+  bun run get_pump_wallets.ts --candidate-file ./top-pnl.csv --token <TOKEN_CA>
 
 Options:
   --token <CA|FILE>      Token mint, comma-separated mints, or a token-list file.
-                         Repeatable. A readable file path is loaded automatically.
+                          Repeatable. A readable file path is loaded automatically.
   --tokens-file <FILE>  Backward-compatible alias for a newline-delimited token list.
+  --candidate-file <FILE>
+  --top-pnl-file <FILE>  Top PnL candidate-wallet export (CSV or JSON). Candidate
+                          tokens are added to the Helius set without turning PnL
+                          into the wallet score.
   -h, --help             Show this help.
 
 Token-list format:
   One Solana mint per line. Blank lines and # comments are ignored.
 
+Candidate-file format (CSV headers):
+  token_ca,wallet,rank,total_pnl_usd,realized_pnl_usd,unrealized_pnl_usd,position_usd,entry_size_usd,token_balance,observed_at
+
 Behavior:
   - Explicit --token values are always scanned by Helius.
   - Helius token scans are intentionally serial: one token is held in memory at a time.
+  - --candidate-file adds Top PnL candidate tokens without turning PnL into the wallet score.
+  - Candidate rows are persisted with their PnL fields as discovery metadata plus the Helius match.
   - When DEBOT_ENABLED=true and DEBOT_SCAN_CANDIDATES=true, DeBot pump-precursor
     candidates are added to the Helius token set (deduplicated).
   - Set DEBOT_SCAN_CANDIDATES=false to analyze only explicit CLI tokens.
@@ -102,7 +117,7 @@ async function expandTokenArgument(value: string): Promise<string[]> {
 }
 
 /** Parse repeated --token values, including the requested --token ./tokenlist.txt form. */
-async function parseCli(): Promise<string[]> {
+async function parseCli(): Promise<{ tokens: string[]; candidateFile: string | null }> {
   const args = Bun.argv.slice(2);
   if (args.includes('-h') || args.includes('--help')) {
     printHelp();
@@ -110,6 +125,7 @@ async function parseCli(): Promise<string[]> {
   }
 
   const tokens: string[] = [];
+  let candidateFile: string | null = null;
 
   for (let i = 0; i < args.length; i += 1) {
     const arg = args[i];
@@ -123,6 +139,16 @@ async function parseCli(): Promise<string[]> {
       continue;
     }
 
+    if (arg === '--candidate-file' || arg === '--top-pnl-file') {
+      const value = args[++i];
+      if (!value || value.startsWith('-')) {
+        throw new Error(`Missing value for ${arg}`);
+      }
+      if (candidateFile) throw new Error('Only one --candidate-file value is supported');
+      candidateFile = value;
+      continue;
+    }
+
     throw new Error(`Unknown option: ${arg}`);
   }
 
@@ -133,7 +159,7 @@ async function parseCli(): Promise<string[]> {
     }
   }
 
-  return unique;
+  return { tokens: unique, candidateFile };
 }
 
 function tokenDir(config: Config, token: string): string {
@@ -173,6 +199,7 @@ async function analyzeOne(
   source: TokenSource,
   debotObservedAt: string | null,
   debotSignal: DeBotTrendingSignal | null,
+  topPnlCandidates: WalletCandidate[],
   runId: string,
 ): Promise<IntegratedResponse> {
   await logger.info(`Token ${token}: starting historical scan | source=${source} run=${runId}`);
@@ -190,6 +217,7 @@ async function analyzeOne(
       scanSource: source,
       debotObservedAt,
       debotSignal,
+      topPnlCandidates,
     },
   };
   await writeTokenResponse(config, response);
@@ -231,6 +259,25 @@ async function exportGlobalViews(db: ResearchDb, config: Config): Promise<void> 
     `SELECT * FROM debot_signals ORDER BY observed_at_sec DESC, pump_precursor_score DESC NULLS LAST, token_ca`,
     `${config.globalExportDir}/debot-signals.csv`,
   );
+  // Top PnL candidates joined to cross-token evidence. PnL columns are
+  // discovery metadata; entry/qualification columns carry the verdict.
+  await exportGlobalCsv(
+    db,
+    `SELECT c.run_id, c.source, c.token_ca, c.wallet, c.candidate_rank,
+            c.total_pnl_usd, c.realized_pnl_usd, c.unrealized_pnl_usd,
+            c.position_usd, c.entry_size_usd, c.token_balance, c.observed_at,
+            c.scan_status, c.match_status, c.observation_pumps,
+            c.entry_evidence_score, c.pre_pump_pumps, c.control_backed_pumps,
+            c.median_seconds_before_pump, c.pre_pump_buy_sol, c.pump_count,
+            c.qualification_reason,
+            g.tokens_with_candidates, g.pump_windows_led, g.pre_pump_buy_sol AS global_pre_pump_buy_sol,
+            g.median_lead_seconds, g.median_excess_forward30,
+            g.avg_reliability_adjusted_excess_forward30
+       FROM candidate_wallets c
+       LEFT JOIN wallet_global_summary g ON g.wallet = c.wallet
+       ORDER BY c.source, c.token_ca, c.candidate_rank NULLS LAST, c.wallet`,
+    `${config.globalExportDir}/candidate-wallet-analysis.csv`,
+  );
 }
 
 /** Print a compact summary for one token after it has been analyzed. */
@@ -252,6 +299,13 @@ function printResponseSummary(response: IntegratedResponse, config: Config): voi
     console.log(
       `DeBot  : pump=${signal.pumpPrecursorScore?.toFixed(2) ?? 'n/a'} activity=${signal.activityScore?.toFixed(2) ?? 'n/a'} rank=${signal.rank1m ?? '-'}/${signal.rank5m ?? '-'}`,
     );
+  }
+
+  if (response.integration.topPnlCandidates.length > 0) {
+    const matched = response.walletLeaders.filter((leader) =>
+      response.integration.topPnlCandidates.some((candidate) => candidate.wallet === leader.wallet),
+    ).length;
+    console.log(`TopPnL : ${response.integration.topPnlCandidates.length} candidate row(s), ${matched} matched leader(s)`);
   }
 
   if (strongest) {
@@ -336,9 +390,16 @@ async function discoverWithDeBot(
 /** Main integrated workflow: DeBot discovery → Helius → DuckDB. */
 async function main(): Promise<void> {
   const config = loadConfig();
-  const cliTokens = await parseCli();
+  const { tokens: cliTokens, candidateFile } = await parseCli();
   const rootLogger = await Logger.create(config.logDir);
-  await rootLogger.info(`Starting integrated scan | explicit tokens=${cliTokens.length}`);
+  await rootLogger.info(`Starting integrated scan | explicit tokens=${cliTokens.length} candidateFile=${candidateFile ?? 'none'}`);
+
+  // Top PnL candidates: discovery metadata only, never a predictive score.
+  let topPnlCandidates: WalletCandidate[] = [];
+  if (candidateFile) {
+    topPnlCandidates = await readTopPnlCandidates(candidateFile);
+    await rootLogger.info(`Top PnL candidates: ${topPnlCandidates.length} wallet rows from ${candidateFile}`);
+  }
   await rootLogger.info(
     `DeBot config: enabled=${config.debotEnabled} scanCandidates=${config.debotScanCandidates} ` +
     `minScore=${config.debot.minPumpPrecursorScore} minEvidence=${config.debot.minPumpPrecursorEvidence} ` +
@@ -352,7 +413,9 @@ async function main(): Promise<void> {
 
     // Explicit --token scans never spend DeBot discovery requests: the token
     // set is already known, so the 1m/5m/heatmap fetch is pure overhead.
-    if (config.debotEnabled && cliTokens.length === 0) {
+    // A candidate file counts as explicit for the same reason.
+    const hasExplicitTokens = cliTokens.length > 0 || topPnlCandidates.length > 0;
+    if (config.debotEnabled && !hasExplicitTokens) {
       try {
         const discovered = await discoverWithDeBot(config, rootLogger);
         debotSnapshot = discovered.snapshot;
@@ -362,19 +425,25 @@ async function main(): Promise<void> {
         await rootLogger.error('DeBot discovery or DuckDB persistence failed; continuing with explicit CLI tokens', error);
         if (config.debotScanCandidates && cliTokens.length === 0) throw error;
       }
-    } else if (cliTokens.length > 0) {
-      await rootLogger.info(`DeBot discovery skipped: ${cliTokens.length} explicit CLI token(s) provided`);
+    } else if (hasExplicitTokens) {
+      await rootLogger.info(`DeBot discovery skipped: ${cliTokens.length} explicit CLI token(s), ${topPnlCandidates.length} Top PnL candidate rows provided`);
     }
 
-    const sources = new Map<string, TokenSource>();
-    for (const token of cliTokens) sources.set(token, 'cli');
+    const sourceParts = new Map<string, Set<TokenSourcePart>>();
+    const addSource = (token: string, part: TokenSourcePart): void => {
+      const existing = sourceParts.get(token);
+      if (existing) existing.add(part);
+      else sourceParts.set(token, new Set([part]));
+    };
+    for (const token of cliTokens) addSource(token, 'cli');
+    for (const candidate of topPnlCandidates) addSource(candidate.tokenCa, 'candidate');
 
     if (config.debotEnabled && config.debotScanCandidates) {
-      for (const signal of debotCandidates) {
-        if (!sources.has(signal.address)) sources.set(signal.address, 'debot');
-        else sources.set(signal.address, 'cli+debot');
-      }
+      for (const signal of debotCandidates) addSource(signal.address, 'debot');
     }
+    const sources = new Map<string, TokenSource>(
+      [...sourceParts.entries()].map(([token, parts]) => [token, [...parts].sort().join('+')]),
+    );
 
     if (sources.size === 0) {
       if (config.debotEnabled && config.debotScanCandidates && debotSnapshot) {
@@ -394,6 +463,7 @@ async function main(): Promise<void> {
     console.log(`\nTokens to analyze : ${tokens.length}`);
     console.log(`Explicit tokens   : ${cliTokens.length}`);
     console.log(`DeBot candidates  : ${debotCandidates.length}`);
+    console.log(`Top PnL rows      : ${topPnlCandidates.length}`);
     console.log('Helius token mode  : serial (1 token at a time)');
 
     // One analysis_run_id per invocation so multi-run datasets never mix
@@ -429,6 +499,7 @@ async function main(): Promise<void> {
       const tokenScanStartedAt = new Date().toISOString();
       try {
         const debotSignal = debotSnapshot?.signals.find((signal) => signal.address === token) ?? null;
+        const tokenCandidates = candidatesForToken(topPnlCandidates, token);
         const result = await analyzeOne(
           config,
           token,
@@ -436,6 +507,7 @@ async function main(): Promise<void> {
           source,
           debotSnapshot?.fetchedAt ?? null,
           debotSignal,
+          tokenCandidates,
           runId,
         );
 
@@ -447,6 +519,13 @@ async function main(): Promise<void> {
           result.integration.debotSignal,
           result.integration.debotObservedAt,
         );
+        if (tokenCandidates.length > 0) {
+          await db.replaceCandidateSnapshots(
+            token,
+            tokenCandidates.map((candidate) => snapshotCandidate(candidate, result, 'completed')),
+          );
+          await logger.info(`Token ${token}: ${tokenCandidates.length} Top PnL candidate snapshot(s) persisted`);
+        }
         success += 1;
         printResponseSummary(result, config);
 
@@ -463,7 +542,7 @@ async function main(): Promise<void> {
         await Bun.write(
           `${dir}/response.json`,
           JSON.stringify({
-            version: 11,
+            version: RESEARCH_VERSION,
             token,
             status: 'error',
             scannedAt: new Date().toISOString(),
@@ -473,10 +552,27 @@ async function main(): Promise<void> {
             integration: {
               scanSource: sources.get(token) ?? 'cli',
               debotObservedAt: debotSnapshot?.fetchedAt ?? null,
+              topPnlCandidates: candidatesForToken(topPnlCandidates, token),
             },
             error: errorMessage,
           }, null, 2),
         );
+        // Failed scans still record their candidate rows (auditable misses).
+        const failedCandidates = candidatesForToken(topPnlCandidates, token);
+        if (failedCandidates.length > 0) {
+          try {
+            await db.replaceCandidateSnapshots(
+              token,
+              failedCandidates.map((candidate) => snapshotCandidate(
+                candidate,
+                { runId, walletLeaders: [], walletPumpObservations: [] } as unknown as AnalysisResponse,
+                scanStatus === 'completed' ? 'error' : scanStatus,
+              )),
+            );
+          } catch (dbError) {
+            await logger.error(`Token ${token}: candidate snapshot failed (original error preserved)`, dbError);
+          }
+        }
         // Best-effort DB failure record: budget skips stay visible as explicit
         // scan_status rows and never overwrite a previous success.
         try {

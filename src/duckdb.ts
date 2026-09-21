@@ -11,6 +11,7 @@ import type {
 } from './analyzer';
 import type { Logger } from './logger';
 import type { DeBotTrendingSignal, DeBotTrendingSnapshot } from './debot_client';
+import type { CandidateWalletSnapshot } from './candidate_store';
 
 
 /**
@@ -473,6 +474,34 @@ export class ResearchDb {
       ALTER TABLE wallet_pump_observations ADD COLUMN IF NOT EXISTS entry_evidence_score DOUBLE DEFAULT 0;
       ALTER TABLE wallet_token_summary ADD COLUMN IF NOT EXISTS entry_evidence_score DOUBLE DEFAULT 0;
       ALTER TABLE pump_buy_events ADD COLUMN IF NOT EXISTS entry_evidence_score DOUBLE DEFAULT 0;
+
+      -- Top PnL / manual candidate wallets joined to Helius evidence.
+      -- PnL fields are discovery metadata, never a predictive score.
+      CREATE TABLE IF NOT EXISTS candidate_wallets (
+        run_id VARCHAR NOT NULL,
+        source VARCHAR NOT NULL,
+        token_ca VARCHAR NOT NULL,
+        wallet VARCHAR NOT NULL,
+        candidate_rank INTEGER,
+        total_pnl_usd DOUBLE,
+        realized_pnl_usd DOUBLE,
+        unrealized_pnl_usd DOUBLE,
+        position_usd DOUBLE,
+        entry_size_usd DOUBLE,
+        token_balance DOUBLE,
+        observed_at VARCHAR,
+        scan_status VARCHAR NOT NULL,
+        match_status VARCHAR NOT NULL,
+        observation_pumps INTEGER NOT NULL DEFAULT 0,
+        entry_evidence_score DOUBLE,
+        pre_pump_pumps INTEGER,
+        control_backed_pumps INTEGER,
+        median_seconds_before_pump DOUBLE,
+        pre_pump_buy_sol DOUBLE,
+        pump_count INTEGER,
+        qualification_reason VARCHAR,
+        PRIMARY KEY (run_id, source, token_ca, wallet)
+      );
     `);
   }
 
@@ -743,6 +772,32 @@ export class ResearchDb {
       row.predictiveQualified,
       row.entryEvidenceScore,
     ]);
+  }
+
+  /**
+   * Replace one token's candidate snapshots (latest run wins, mirroring the
+   * other per-token tables; run_id preserves provenance across re-scans).
+   */
+  async replaceCandidateSnapshots(token: string, rows: CandidateWalletSnapshot[]): Promise<void> {
+    const safe = token.replace(/[^1-9A-HJ-NP-Za-km-z]/g, '');
+    if (safe !== token) throw new Error(`Unsafe token for candidate replace: ${token}`);
+    await this.connection.run('BEGIN TRANSACTION');
+    try {
+      await this.connection.run(`DELETE FROM candidate_wallets WHERE token_ca = '${safe}'`);
+      await this.insertRows('candidate_wallets', rows, (row) => [
+        row.runId, row.source, row.tokenCa, row.wallet, row.candidateRank ?? null,
+        row.totalPnlUsd ?? null, row.realizedPnlUsd ?? null, row.unrealizedPnlUsd ?? null,
+        row.positionUsd ?? null, row.entrySizeUsd ?? null, row.tokenBalance ?? null,
+        row.observedAt ?? null, row.scanStatus, row.matchStatus, row.observationPumps,
+        row.entryEvidenceScore ?? null, row.prePumpPumps ?? null, row.controlBackedPumps ?? null,
+        row.medianSecondsBeforePump ?? null, row.prePumpBuySol ?? null, row.pumpCount ?? null,
+        row.qualificationReason ?? null,
+      ]);
+      await this.connection.run('COMMIT');
+    } catch (error) {
+      await this.connection.run('ROLLBACK');
+      throw error;
+    }
   }
 
   /** Append normalized rows with parameterized SQL in small batches. */

@@ -6,7 +6,7 @@
   "scripts": {
     "start": "bun run get_pump_wallets.ts",
     "check": "tsc --noEmit",
-    "test": "bun test tests/pump_leaders.test.ts",
+    "test": "bun test tests/pump_leaders.test.ts tests/top_pnl.test.ts",
     "help": "bun run get_pump_wallets.ts --help"
   },
   "dependencies": {

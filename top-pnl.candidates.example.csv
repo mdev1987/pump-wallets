@@ -1,0 +1,4 @@
+# Export or manually prepare Top PnL candidates for research discovery.
+# Only token_ca and wallet are required. PnL fields are metadata, not a predictive score.
+token_ca,wallet,rank,total_pnl_usd,realized_pnl_usd,unrealized_pnl_usd,position_usd,entry_size_usd,token_balance,observed_at
+So11111111111111111111111111111111111111112,11111111111111111111111111111111,1,12500,10300,2200,4800,1600,2500000,2026-09-20T18:00:00Z
