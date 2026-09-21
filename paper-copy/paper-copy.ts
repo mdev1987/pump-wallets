@@ -300,7 +300,7 @@ async function main(): Promise<void> {
       for (const leg of ev.partials) {
         state.balanceSol += (leg.qtyTokens / pos.qtyTokens) * cfg.posSizeSol * (leg.priceUsd / pos.entryPriceUsd) - cfg.feeLegSol;
         dirty = true;
-        await send(partialReport(pos, leg, solUsdCache));
+        await send(partialReport(cfg, pos, leg, solUsdCache));
       }
       if (ev.closed) {
         const last = pos.legs.at(-1)!;
