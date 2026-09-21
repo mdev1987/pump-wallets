@@ -7,10 +7,11 @@
 
 export type EngineConfig = {
   posSizeSol: number;
-  tp1Pct: number; // e.g. 0.25 -> sell tp1Share at +25%
+  tp1Pct: number; // e.g. 0.12 -> sell tp1Share at +12%
   tp1Share: number; // e.g. 0.5
-  tp2Pct: number; // e.g. 0.5 -> sell rest at +50%
+  tp2Pct: number; // e.g. 0.4 -> sell rest at +40%
   trailPct: number; // e.g. 0.15 -> trailing stop 15% under peak
+  trailTightPct: number; // trailing stop once TP1 has filled (locks the partial)
   maxHoldSec: number;
   feeOpenSol: number;
   feeLegSol: number;
@@ -18,10 +19,11 @@ export type EngineConfig = {
 
 export const DEFAULT_CONFIG: EngineConfig = {
   posSizeSol: 0.05,
-  tp1Pct: 0.25,
+  tp1Pct: 0.12,
   tp1Share: 0.5,
-  tp2Pct: 0.5,
+  tp2Pct: 0.4,
   trailPct: 0.15,
+  trailTightPct: 0.08,
   maxHoldSec: 2400,
   feeOpenSol: 0.0002,
   feeLegSol: 0.0001,
@@ -118,7 +120,10 @@ export function tickPosition(cfg: EngineConfig, pos: Position, priceUsd: number,
   if (pos.status !== 'open' || !(priceUsd > 0)) return { partials, closed: false, closeReason: null };
   if (priceUsd > pos.peakPriceUsd) {
     pos.peakPriceUsd = priceUsd;
-    pos.stopPriceUsd = Math.max(pos.stopPriceUsd, priceUsd * (1 - cfg.trailPct));
+    // After the first partial, tighten the trail so a +20-30% runner that
+    // fades keeps most of the move instead of round-tripping to the wide stop.
+    const trail = pos.tp1Done ? cfg.trailTightPct : cfg.trailPct;
+    pos.stopPriceUsd = Math.max(pos.stopPriceUsd, priceUsd * (1 - trail));
   }
   const ret = priceUsd / pos.entryPriceUsd - 1;
 
@@ -127,6 +132,8 @@ export function tickPosition(cfg: EngineConfig, pos: Position, priceUsd: number,
     const qty = pos.remainingQty * cfg.tp1Share;
     pos.remainingQty -= qty;
     partials.push({ kind: 'tp1', priceUsd, qtyTokens: qty, pnlSol: legPnlSol(cfg, pos, qty, priceUsd), atMs: nowMs });
+    // Lock the partial immediately: tighten the stop to the fill price regime.
+    pos.stopPriceUsd = Math.max(pos.stopPriceUsd, priceUsd * (1 - cfg.trailTightPct));
   }
 
   let closed = false;

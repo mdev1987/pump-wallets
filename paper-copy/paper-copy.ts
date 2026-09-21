@@ -321,6 +321,12 @@ async function main(): Promise<void> {
         if (newestSig) state.lastSig[t.wallet] = newestSig;
         for (const b of buys) {
           if (state.positions.some((p) => p.status === 'open' && p.mint === b.mint)) continue;
+          // One open position per wallet: kEFiAX-class hyperactivity would
+          // otherwise fill every slot with correlated bets on one actor.
+          if (state.positions.some((p) => p.status === 'open' && p.wallet === t.wallet)) {
+            console.log(`skip ${b.mint.slice(0, 8)}: wallet already has an open position`);
+            continue;
+          }
           if (state.positions.filter((p) => p.status === 'open').length >= MAX_OPEN_POSITIONS) break;
           if ((state.cooldownUntil[`${t.wallet}:${b.mint}`] ?? 0) > Date.now()) continue;
           const info = (await dexBatch([b.mint])).get(b.mint);
@@ -382,11 +388,13 @@ async function main(): Promise<void> {
     }
   };
 
-  // Price ticks every 30s, wallet sweep every 5 min, SOL/USD refresh hourly.
+  // Price ticks every 30s idle, 15s while positions are open (TP levels live
+  // and die between 30s ticks in this market); wallet sweep every 5 min.
   const priceLoop = async (): Promise<void> => {
     for (;;) {
       await priceTick().catch((e) => console.warn('tick', String(e).slice(0, 120)));
-      await sleep(PRICE_TICK_MS);
+      const hasOpen = state.positions.some((p) => p.status === 'open');
+      await sleep(hasOpen ? 15_000 : PRICE_TICK_MS);
     }
   };
   const sweepLoop = async (): Promise<void> => {

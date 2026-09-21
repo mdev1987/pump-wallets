@@ -58,19 +58,32 @@ describe("paper engine lifecycle", () => {
 
   test("trailing stop ratchets with peak and exits", () => {
     const p = mkPos(1.0);
-    tickPosition(cfg, p, 1.2, 1000); // peak 1.2 -> stop 1.02
-    expect(p.stopPriceUsd).toBeCloseTo(1.02, 6);
-    const ev = tickPosition(cfg, p, 1.01, 2000); // below stop
+    tickPosition(cfg, p, 1.1, 1000); // peak 1.1 -> stop 0.935 (below TP1)
+    expect(p.stopPriceUsd).toBeCloseTo(1.1 * (1 - cfg.trailPct), 6);
+    const ev = tickPosition(cfg, p, 0.93, 2000); // below stop
     expect(ev.closed).toBe(true);
     expect(p.closeReason).toContain("trailing");
   });
 
   test("stop never ratchets down on dips", () => {
     const p = mkPos(1.0);
-    tickPosition(cfg, p, 1.2, 1000);
-    tickPosition(cfg, p, 1.05, 2000);
-    expect(p.stopPriceUsd).toBeCloseTo(1.02, 6);
+    tickPosition(cfg, p, 1.1, 1000);
+    tickPosition(cfg, p, 1.0, 2000);
+    expect(p.stopPriceUsd).toBeCloseTo(1.1 * (1 - cfg.trailPct), 6);
     expect(p.status).toBe("open");
+  });
+
+  test("stop tightens after TP1 fill", () => {
+    const p = mkPos(1.0);
+    tickPosition(cfg, p, 1.1, 1000);
+    expect(p.stopPriceUsd).toBeCloseTo(1.1 * (1 - cfg.trailPct), 6);
+    const ev = tickPosition(cfg, p, 1.13, 2000); // TP1 fills at +13%
+    expect(ev.partials).toHaveLength(1);
+    expect(p.stopPriceUsd).toBeCloseTo(1.13 * (1 - cfg.trailTightPct), 6);
+    // Fade to between wide and tight stop: survives wide, dies on tight.
+    const ev2 = tickPosition(cfg, p, 1.0, 3000);
+    expect(ev2.closed).toBe(true);
+    expect(p.closeReason).toContain("trailing");
   });
 
   test("max-hold timeout exits flat-ish positions", () => {
