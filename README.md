@@ -5,13 +5,13 @@ Memory-safe, multi-token Solana pump-window and wallet-leader research pipeline.
 ## Pipeline
 
 ```text
-DeBot 1m + 5m + heatmap
+DeBot 1m + 5m + heatmap  (+ optional Top PnL candidate file)
         ↓
 pump-precursor candidates
         ↓
 one token at a time
         ↓
-Helius signatures-only history
+Helius signatures-only history (density-guarded)
         ↓
 1-minute activity buckets + 1-second fine buckets
         ↓
@@ -19,7 +19,7 @@ busiest windows + quiet pre-spike reconnaissance
         ↓
 union overlapping fetch ranges
         ↓
-recursively split dense ranges
+recursively split dense ranges (fail-closed budget)
         ↓
 Helius full transactions only for selected ranges
         ↓
@@ -27,9 +27,11 @@ parse each page immediately / discard raw page
         ↓
 adaptive fast + sustained pump detection
         ↓
-wallet × pump observations
+distribution tops excluded from leadership evidence
         ↓
-DuckDB + per-token JSON/CSV
+wallet × pump observations (entry evidence vs outcome labels)
+        ↓
+DuckDB + per-token JSON/CSV (+ candidate match snapshots)
 ```
 
 ## Memory and performance
@@ -48,9 +50,13 @@ bun run get_pump_wallets.ts --token TOKEN_CA
 bun run get_pump_wallets.ts --token ./tokens.txt
 
 bun run get_pump_wallets.ts --token TOKEN_A --token TOKEN_B --token ./tokens.txt
+
+bun run get_pump_wallets.ts --candidate-file ./top-pnl.csv --token TOKEN_CA
 ```
 
-With no explicit tokens, DeBot candidates are used when enabled. Explicit tokens are always analyzed.
+With no explicit tokens, DeBot candidates are used when enabled. Explicit tokens are always analyzed. Explicit `--token` scans skip DeBot discovery requests entirely.
+
+Top PnL CSV/JSON (`--candidate-file`, format in `top-pnl.candidates.example.csv`) adds candidate tokens to the scan set. PnL fields are stored as discovery metadata only — they never enter the wallet score. Each candidate is classified afterwards as `matched_leader` / `observed_non_leader` / `not_observed` and exported to `candidate-wallet-analysis.csv`.
 
 ## Per-token output
 
@@ -69,17 +75,21 @@ data/pump_wallets.duckdb
 Key tables:
 
 ```text
-tokens
-pump_windows
-control_baselines
-wallet_pump_observations
-pump_buy_events
-wallet_token_summary
+tokens                  (run_id, scan_started_at/completed_at, scan_status)
+pump_windows            (run_id, is_distribution flagged in JSON)
+control_baselines       (run_id)
+wallet_pump_observations(run_id, entry_evidence_score)
+pump_buy_events         (run_id, entry_evidence_score)
+wallet_token_summary    (run_id, pre_pump_pumps, control_backed_pumps,
+                         predictive_qualified, entry_evidence_score)
 wallet_global_summary
-debot_signals
+debot_signals           (liquidity_bucket, market_cap_bucket)
+candidate_wallets       (Top PnL rows + match snapshots)
 ```
 
-Global CSV exports are written under `data/pump_wallet_exports/`.
+Every row carries `run_id` so multi-run datasets never mix scan times implicitly. Failed scans are recorded in `tokens` with an explicit `scan_status` (`completed` | `budget_exceeded` | `light_history_too_dense` | `error`) and never overwrite a previous success.
+
+Global CSV exports are written under `data/pump_wallet_exports/`, including `candidate-wallet-analysis.csv` (candidates joined to cross-token evidence) and `copy-watchlist.csv` (wallets seen on 2+ tokens, the paper-trading watchlist).
 
 ## DeBot logs
 
@@ -112,6 +122,14 @@ Two paths are used:
 Pump starts are clustered over `PUMP_CLUSTER_SEC`. Wallet evidence includes a 120-second pre-pump window and separate early-pump observations.
 
 Matched control observations below `MIN_CONTROL_BUYS_PER_PUMP` are **flagged, not discarded**.
+
+## Entry evidence vs outcome labels
+
+Wallet ranking uses **entry-time evidence only**: timing, size, and buy-flow shares computed solely from buys visible at or before each trade timestamp. Forward returns and control-adjusted outcomes are stored as evaluation labels, never ranking inputs — ranking on them would leak future price action into a supposedly predictive order.
+
+Windows with non-positive net buy flow are classified as **distribution** and excluded from wallet-leader evidence (kept for forensics). Leaders must show strictly pre-pump buys; pure early-pump chasers stay in observations and buy events but cannot rank.
+
+`predictiveQualified` marks the ML-ready subset: repeated (2+) pre-pump pumps **and** repeated (2+) control-sufficient pumps. Everything else remains as observational evidence.
 
 ## Parser diagnostics
 
@@ -162,20 +180,39 @@ The DuckDB layer uses parameterized SQL rather than the native Appender surface 
 
 ## Configuration
 
-All non-CLI settings are read from `.env`. The supplied configuration is deliberately conservative for a 16 GB RAM / 8th-generation i7 workstation:
+All non-CLI settings are read from `.env`. The supplied configuration is tuned for a 2 GB RAM / 1–2 vCPU VPS (a 16 GB workstation can raise the budgets; notes are inline):
 
 - serial token processing
-- 250 ms Helius minimum request interval
+- 350 ms Helius minimum request interval
 - 1,000 signature records/request for discovery
-- 8 active 5-minute windows
-- 2 quiet reconnaissance windows
-- 5,000 estimated full transactions per planned range
-- 64 maximum planned full-query ranges
+- 4 active 5-minute windows
+- 1 quiet reconnaissance window
+- 2,500 estimated full transactions per planned range
+- 32 maximum planned full-query ranges (fail-closed, never truncated)
+- 100,000 maximum light-scan signatures per token (fail-fast density guard)
+- 24 h artifact skip for DeBot re-scans (`RESCAN_SKIP_SEC`)
 - 120-second pump clustering
 - 120-second pre-pump wallet context
 - 30-second forward observation slack for sparse tokens
+- DuckDB capped to 1 thread / 600 MB with disk spill
 
 These are research starting values and should be validated across many tokens.
+
+## Paper copy-trading (`paper-copy/`)
+
+A separate Bun service (own oxmgr app) watches the top leader wallets and paper-trades their entries at 0.05 SOL with a TP ladder, trailing stop, and Telegram alerts (grammy + MarkdownV2). No chain execution anywhere: all market data is read-only and positions live in `paper-copy/paper_state.json`.
+
+- entry gates: copy-size buys only, liquidity/mcap/age bounds, RugCheck danger veto
+- exits: TP ladder partials, trailing stop (tightens after first partial), max-hold timeout
+- guards: 1 open position per wallet, 3 opens per wallet per day, momentum-chase veto (>+20% m5), entry circuit breaker on Helius errors
+- ledger self-audit every sweep plus state backups
+- Helius sweep is two-tier: cheap signatures-only change detection, full parsing of the fresh delta only
+
+```bash
+cd paper-copy && bun install
+bun run check   # tsc --noEmit
+bun run test    # unit tests (engine lifecycle, gates, ranking)
+```
 
 ## Version 11 changes
 
@@ -187,3 +224,15 @@ These are research starting values and should be validated across many tokens.
 - Early-pump buys and insufficient control baselines are retained as explicit evidence.
 - DeBot requires volume acceleration above 1.0x for pump-precursor candidates.
 - One-token-at-a-time processing remains mandatory for predictable memory use.
+
+## Later hardening (same v11 lineage)
+
+- Fail-closed budgets: density cap, window cap, no truncation anywhere; failures recorded with `scan_status`.
+- Provenance: `run_id` + scan timestamps on every table and artifact.
+- Entry/outcome split: prospective ranking on entry evidence only; forwards stay labels.
+- Distribution exclusion, pre-pump leadership requirement, `predictiveQualified` (2+ pre-pump and 2+ backed pumps).
+- Router-aware parser diagnostics (`router_like_swap` split out of direction mismatches).
+- DeBot liquidity/market-cap regime buckets; explicit `--token` runs skip DeBot requests.
+- Top PnL candidate files (`--candidate-file`) with match snapshots.
+- Operational: flock single-instance guard, cron-skip logging, exit-proof logging, fresh-artifact rescan skip, DuckDB memory cap.
+- `paper-copy/` paper-trading service and `tests/` regression suite (`bun run test`).
