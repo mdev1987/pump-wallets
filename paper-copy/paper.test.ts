@@ -57,6 +57,25 @@ describe("paper engine lifecycle", () => {
     expect(positionPnlSol(p)).toBeGreaterThan(0);
   });
 
+  test("partial fills persist in pos.legs exactly once (ledger integrity)", () => {
+    const p = mkPos(1.0);
+    const credited: number[] = [];
+    let ev = tickPosition(cfg, p, 1.26, 2000);
+    for (const l of ev.partials) credited.push(l.qtyTokens);
+    // Emulate the service: partials credited now, close leg credited at close.
+    ev = tickPosition(cfg, p, 1.5, 3000);
+    for (const l of ev.partials) credited.push(l.qtyTokens);
+    if (ev.closed) {
+      const last = p.legs.at(-1)!;
+      credited.push(last.qtyTokens);
+    }
+    // Every credited token accounted once across legs; legs match positions.
+    const legsTotal = p.legs.reduce((s, l) => s + l.qtyTokens, 0);
+    expect(legsTotal).toBeCloseTo(p.qtyTokens, 9);
+    expect(credited.reduce((s, q) => s + q, 0)).toBeCloseTo(p.qtyTokens, 9);
+    expect(positionPnlSol(p)).toBeGreaterThan(0);
+  });
+
   test("partial ladder leaves a runner for trail/timeout", () => {
     const twoRung = { ...cfg, tpLadder: [{ pct: 1.0, share: 0.2 }, { pct: 2.0, share: 0.2 }] };
     const p = mkPos(1.0);

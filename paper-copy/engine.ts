@@ -151,14 +151,18 @@ export function tickPosition(cfg: EngineConfig, pos: Position, priceUsd: number,
     pos.tpDone[i] = true;
     const qty = Math.min(pos.qtyTokens * rung.share, pos.remainingQty);
     pos.remainingQty -= qty;
-    partials.push({
+    // Partial legs join pos.legs immediately: otherwise realized partial PnL
+    // is credited to the ledger but invisible to positionPnlSol/close records.
+    const leg: ExitLeg = {
       kind: 'tp',
       label: `TP +${(rung.pct * 100).toFixed(0)}% (${(rung.share * 100).toFixed(0)}%)`,
       priceUsd,
       qtyTokens: qty,
       pnlSol: legPnlSol(cfg, pos, qty, priceUsd),
       atMs: nowMs,
-    });
+    };
+    pos.legs.push(leg);
+    partials.push(leg);
     // Lock the partial immediately: tighten the stop to the fill price regime.
     pos.stopPriceUsd = Math.max(pos.stopPriceUsd, priceUsd * (1 - cfg.trailTightPct));
   }
@@ -184,11 +188,13 @@ export function tickPosition(cfg: EngineConfig, pos: Position, priceUsd: number,
     const lastRung = cfg.tpLadder[lastIdx];
     const label = lastRung ? `TP +${(lastRung.pct * 100).toFixed(0)}% (ladder complete)` : 'ladder complete';
     if (lastFill) {
+      // lastFill is already recorded in pos.legs (same object): relabel it
+      // and withhold it from partials so the service credits it once, here.
       partials.pop();
+      lastFill.label = label;
       pos.remainingQty = lastFill.qtyTokens;
       pos.status = 'closed';
       pos.closeReason = label;
-      pos.legs.push({ ...lastFill, label });
       closed = true;
       closeReason = label;
     } else {
