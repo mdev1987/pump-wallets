@@ -314,11 +314,13 @@ async function main(): Promise<void> {
     if (dirty) await saveState(state);
   };
 
-  const sweep = async (): Promise<void> => {
+  const sweep = async (): Promise<number> => {
+    let fresh = 0;
     for (const t of tracked) {
       try {
         const { buys, newestSig } = await recentBuys(pool, t.wallet, state.lastSig[t.wallet] ?? null);
         if (newestSig) state.lastSig[t.wallet] = newestSig;
+        fresh += buys.length;
         for (const b of buys) {
           if (state.positions.some((p) => p.status === 'open' && p.mint === b.mint)) continue;
           // One open position per wallet: kEFiAX-class hyperactivity would
@@ -386,6 +388,7 @@ async function main(): Promise<void> {
       }
       await sleep(WALLET_SPACING_MS);
     }
+    return fresh;
   };
 
   // Price ticks every 30s idle, 15s while positions are open (TP levels live
@@ -400,7 +403,17 @@ async function main(): Promise<void> {
   const sweepLoop = async (): Promise<void> => {
     for (;;) {
       solUsdCache = (await solUsd().catch(() => solUsdCache)) ?? solUsdCache;
-      await sweep().catch((e) => console.warn('sweep', String(e).slice(0, 120)));
+      const t0 = Date.now();
+      let fresh = 0;
+      try {
+        fresh = await sweep();
+      } catch (e) {
+        console.warn('sweep', String(e).slice(0, 120));
+      }
+      const open = state.positions.filter((p) => p.status === 'open').length;
+      // Heartbeat every sweep: proves liveness even when the market is quiet
+      // (no entries/exits), which the log-freshness health check needs.
+      console.log(`sweep complete: ${tracked.length} wallets, ${fresh} fresh buys, ${open} open, balance ${state.balanceSol.toFixed(4)} SOL, ${((Date.now() - t0) / 1000).toFixed(0)}s`);
       await sleep(SWEEP_INTERVAL_MS);
     }
   };
