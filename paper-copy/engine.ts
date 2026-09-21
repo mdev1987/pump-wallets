@@ -154,6 +154,31 @@ export function positionPnlSol(pos: Position): number {
   return pos.legs.reduce((s, l) => s + l.pnlSol, 0);
 }
 
+export type RugAssessment = { veto: boolean; reason: string; score: number | null };
+
+/**
+ * RugCheck gate on the NORMALIZED 0-100 scale. Meme tokens routinely score
+ * 50-75 on low-liquidity warnings alone, so a flat `score > 50` veto blocks
+ * every entry in this market. Veto only on explicit danger findings (or an
+ * extreme score); everything else passes with its score logged for review.
+ */
+export function assessRug(summary: unknown): RugAssessment {
+  if (!summary || typeof summary !== 'object') {
+    return { veto: false, reason: 'unavailable (warn-only)', score: null };
+  }
+  const d = summary as Record<string, unknown>;
+  const score = typeof d['score_normalised'] === 'number' ? (d['score_normalised'] as number) : null;
+  const risks = Array.isArray(d['risks']) ? (d['risks'] as Array<Record<string, unknown>>) : [];
+  const dangers = risks.filter((r) => r['level'] === 'danger').map((r) => String(r['name'] ?? 'unnamed'));
+  if (dangers.length > 0) {
+    return { veto: true, reason: `danger: ${dangers.slice(0, 3).join(', ')}`, score };
+  }
+  if (score !== null && score >= 85) {
+    return { veto: true, reason: `extreme score ${score}`, score };
+  }
+  return { veto: false, reason: score === null ? 'unscored (warn-only)' : `score ${score}, no danger findings`, score };
+}
+
 export function fmtUsd(v: number | null): string {
   if (v === null || !Number.isFinite(v)) return 'n/a';
   if (v === 0) return '$0';

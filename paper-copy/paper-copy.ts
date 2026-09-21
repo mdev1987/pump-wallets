@@ -12,6 +12,7 @@ import { convert } from 'telegram-markdown-v2';
 import { readFile, writeFile, rename, mkdir } from 'node:fs/promises';
 import {
   DEFAULT_CONFIG,
+  assessRug,
   openPosition,
   tickPosition,
   positionPnlSol,
@@ -176,23 +177,22 @@ async function dexBatch(mints: string[]): Promise<Map<string, DexInfo>> {
   return out;
 }
 
-async function rugScore(mint: string): Promise<number | null> {
-  // RugCheck summary carries a raw additive `score` (thousands) alongside a
-  // 0-100 `score_normalised`. The RUGCHECK_MAX_SCORE gate is calibrated to the
-  // NORMALIZED scale — reading the raw score vetoes everything.
-  try {
-    const d = (await fetchJson(`https://api.rugcheck.xyz/v1/tokens/${mint}/report/summary`)) as Record<string, unknown>;
-    if (typeof d['score_normalised'] === 'number') return d['score_normalised'] as number;
-    for (const k of ['risk_score', 'total_score']) {
-      if (typeof d[k] === 'number') return d[k] as number;
-    }
-    const r = d['risk'] as Record<string, unknown> | undefined;
-    if (r && typeof r['score'] === 'number') return r['score'] as number;
-  } catch { /* warn-only */ }
-  return null;
+async function rugSummary(mint: string): Promise<unknown> {
+  return fetchJson(`https://api.rugcheck.xyz/v1/tokens/${mint}/report/summary`);
 }
 
 async function solUsd(): Promise<number | null> {
+  // DexScreener primary: Jupiter price v3 is Cloudflare-gated for non-browser
+  // clients (HTTP 1010), which starved entries of SOL/USD entirely.
+  try {
+    const d = (await fetchJson(
+      'https://api.dexscreener.com/tokens/v1/solana/So11111111111111111111111111111111111111112',
+    )) as Array<Record<string, unknown>>;
+    const px = (Array.isArray(d) ? d : [])
+      .map((p) => Number(p['priceUsd'] ?? NaN))
+      .find((v) => Number.isFinite(v) && v > 0);
+    if (px !== undefined) return px;
+  } catch { /* fall through to Jupiter */ }
   try {
     const d = (await fetchJson('https://api.jup.ag/price/v3?ids=So11111111111111111111111111111111111111112')) as Record<string, Record<string, number>>;
     return d?.['So11111111111111111111111111111111111111112']?.['price'] ?? null;
@@ -328,10 +328,19 @@ async function main(): Promise<void> {
           if ((info.liqUsd ?? 0) < MIN_LIQ_USD) continue;
           if ((info.mcapUsd ?? Infinity) > MAX_MCAP_USD) continue;
           if ((info.ageHours ?? 0) > MAX_AGE_HOURS) continue;
-          const rug = await rugScore(b.mint);
-          if (rug !== null && rug > RUG_MAX_SCORE) {
-            console.log(`rug veto ${b.mint} score=${rug}`);
-            continue;
+          let rug: number | null = null;
+          try {
+            const assessment = assessRug(await rugSummary(b.mint));
+            rug = assessment.score;
+            if (assessment.veto) {
+              console.log(`rug veto ${b.mint} ${assessment.reason}`);
+              continue;
+            }
+            if (assessment.score !== null && assessment.score > RUG_MAX_SCORE) {
+              console.log(`rug warn ${b.mint} ${assessment.reason} (warn-only, proceeding)`);
+            }
+          } catch {
+            console.log(`rug unavailable for ${b.mint} (warn-only, proceeding)`);
           }
           if (state.balanceSol < cfg.posSizeSol + cfg.feeOpenSol) {
             console.log('insufficient paper balance, skipping entry');

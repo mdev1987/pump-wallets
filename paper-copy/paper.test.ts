@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   DEFAULT_CONFIG,
+  assessRug,
   openPosition,
   tickPosition,
   positionPnlSol,
@@ -9,6 +10,24 @@ import {
   startupReport,
   type Position,
 } from "./engine";
+
+describe("rug gate (normalized scale, danger-based veto)", () => {
+  test("vetoes danger findings, warns through mid scores", () => {
+    expect(assessRug(null).veto).toBe(false);
+    expect(assessRug({ score_normalised: 61, risks: [{ name: "Low Liquidity", level: "warn" }] }).veto).toBe(false);
+    const danger = assessRug({ score_normalised: 61, risks: [{ name: "Mint authority", level: "danger" }] });
+    expect(danger.veto).toBe(true);
+    expect(danger.reason).toContain("Mint authority");
+    expect(assessRug({ score_normalised: 95, risks: [] }).veto).toBe(true);
+  });
+
+  test("does not mistake the raw additive score for risk", () => {
+    // Real summary shape: raw score in the thousands next to a 0-100 normalized one.
+    const r = assessRug({ score: 10146, score_normalised: 50, risks: [] });
+    expect(r.veto).toBe(false);
+    expect(r.score).toBe(50);
+  });
+});
 
 const cfg = { ...DEFAULT_CONFIG };
 
