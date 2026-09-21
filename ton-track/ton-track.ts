@@ -143,15 +143,32 @@ async function resolveChat(bot: Bot, configured: string): Promise<string> {
   throw new Error('no Telegram chat found: message the bot (/start) or set TON_CHAT_ID');
 }
 
+async function localSecret(name: string): Promise<string> {
+  try {
+    return (await readFile(`${DIR}.token`, 'utf8')).trim();
+  } catch {
+    return '';
+  }
+}
+
 async function main(): Promise<void> {
   const envFile = await loadEnvFile(AVE_ENV);
-  const botToken = process.env['TON_BOT_TOKEN'] ?? envFile['TON_BOT_TOKEN'] ?? process.env['TELEGRAM_BOT_TOKEN'] ?? '';
+  // Token precedence: env -> local 600-perm .token file (gitignored).
+  // Chat: learned once via getUpdates, then cached to .chat (gitignored).
+  let chatCache = '';
+  try {
+    chatCache = (await readFile(`${DIR}.chat`, 'utf8')).trim();
+  } catch { /* first boot */ }
+  const botToken = process.env['TON_BOT_TOKEN'] ?? (await localSecret('token')) ?? process.env['TELEGRAM_BOT_TOKEN'] ?? '';
   // NOTE: no TON_CHAT_ID exists yet; reuse the operator chat as first guess.
-  const chatGuess = process.env['TON_CHAT_ID'] ?? process.env['TELEGRAM_CHAT_ID'] ?? envFile['TELEGRAM_CHAT_ID'] ?? '';
+  const chatGuess = chatCache || process.env['TON_CHAT_ID'] || process.env['TELEGRAM_CHAT_ID'] || envFile['TELEGRAM_CHAT_ID'] || '';
   if (!botToken) throw new Error('missing TON_BOT_TOKEN (or TELEGRAM_BOT_TOKEN fallback)');
   const bot = new Bot(botToken);
   const chatId = await resolveChat(bot, chatGuess);
   console.log(`telegram chat resolved: ${chatId}`);
+  if (chatId !== chatCache) {
+    await writeFile(`${DIR}.chat`, `${chatId}\n`, { mode: 0o600 });
+  }
   const send = async (md: string): Promise<void> => {
     const msg = await bot.api.sendMessage(chatId, convert(md), { parse_mode: 'MarkdownV2', link_preview_options: { is_disabled: true } });
     console.log(`telegram delivered message_id=${msg.message_id}`);
