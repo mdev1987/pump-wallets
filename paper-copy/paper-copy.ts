@@ -106,6 +106,21 @@ async function loadState(): Promise<State> {
     }
     s.mintBuyers ??= {};
     s.opensToday ??= {};
+    // Migrate existing positions to new accounting fields
+    for (const pos of s.positions) {
+      if (pos.cashBeforeSol === undefined) {
+        // Migration for positions created before accounting refactor
+        pos.cashBeforeSol = pos.balanceBeforeSol;
+        pos.cashAfterSol = pos.balanceBeforeSol - (pos.sizeSol ?? 0.05) - (pos.feeOpenSol ?? 0.0002);
+        pos.reservedAfterSol = (pos.sizeSol ?? 0.05) + (pos.feeOpenSol ?? 0.0002);
+        pos.pnlSol = 0;
+        pos.feeOpenSol = 0.0002;
+        pos.stopPriceUsd = pos.entryPriceUsd * (1 - 0.15); // default trailPct
+        pos.unrealizedPnlSol = 0;
+        pos.feeOpenSol = pos.feeOpenSol ?? 0.0002;
+        pos.pnlSol = 0;
+      }
+    }
     return s;
   } catch {
     return { 
@@ -413,10 +428,8 @@ async function main(): Promise<void> {
       const costBasis = pos.sizeSol;
       const unrealized = currentValue - costBasis;
       pos.unrealizedPnlSol = unrealized;
+      totalUnrealized += unrealized;
     }
-    let totalUnrealized = state.positions
-      .filter((p) => p.status === 'open')
-      .reduce((sum, p) => sum + p.unrealizedPnlSol, 0);
     const equity = state.cashSol + state.reservedSol + state.unrealizedPnlSol;
     const expectedEquity = START_BALANCE_SOL + state.realizedPnlSol + totalUnrealized;
     if (Math.abs(equity - expectedEquity) > 0.001) {
@@ -633,3 +646,4 @@ main().catch((e) => {
   console.error(e);
   process.exitCode = 1;
 });
+}
