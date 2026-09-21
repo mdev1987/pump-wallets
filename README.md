@@ -87,7 +87,9 @@ debot_signals           (liquidity_bucket, market_cap_bucket)
 candidate_wallets       (Top PnL rows + match snapshots)
 ```
 
-Every row carries `run_id` so multi-run datasets never mix scan times implicitly. Failed scans are recorded in `tokens` with an explicit `scan_status` (`completed` | `budget_exceeded` | `light_history_too_dense` | `error`) and never overwrite a previous success.
+Every row carries `run_id` so multi-run datasets never mix scan times implicitly — except `wallet_global_summary`, which is a latest-state compatibility view rebuilt from all current per-token rows (no `run_id`; do not read it as one coherent observation period). Failed scans are recorded in `tokens` with an explicit `scan_status` (`completed` | `budget_exceeded` | `light_history_too_dense` | `error`) and never overwrite a previous success.
+
+`prospective-watchlist.csv` ranks wallets on entry-time cross-token evidence only (pre-pump windows/buys/SOL, backed windows). `wallet-global-summary.csv` is ordered retrospectively and must never be read as a prospective leaderboard.
 
 Global CSV exports are written under `data/pump_wallet_exports/`, including `candidate-wallet-analysis.csv` (candidates joined to cross-token evidence) and `copy-watchlist.csv` (wallets seen on 2+ tokens, the paper-trading watchlist).
 

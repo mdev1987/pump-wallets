@@ -37,6 +37,9 @@ export type Config = {
   minMarketTradeSol: number;
   minLeaderTradeSol: number;
   bucketSec: number;
+  minTokenBaseUnits: number;
+  maxPumpPeakReturn: number;
+  coverageMaxGapSec: number;
 
   pumpLookbackSec: number;
   pumpAccelReturn: number;
@@ -184,6 +187,9 @@ export function loadConfig(): Config {
     minMarketTradeSol: positive('MIN_MARKET_TRADE_SOL'),
     minLeaderTradeSol: positive('MIN_LEADER_TRADE_SOL'),
     bucketSec: positiveInt('BUCKET_SEC'),
+    minTokenBaseUnits: nonNegativeInt('MIN_TOKEN_BASE_UNITS'),
+    maxPumpPeakReturn: positive('MAX_PUMP_PEAK_RETURN'),
+    coverageMaxGapSec: positiveInt('COVERAGE_MAX_GAP_SEC'),
 
     pumpLookbackSec: positiveInt('PUMP_LOOKBACK_SEC'),
     pumpAccelReturn: positive('PUMP_ACCEL_RETURN'),
@@ -250,6 +256,7 @@ export function loadConfig(): Config {
       minActivityScore: boundedPercent('DEBOT_MIN_ACTIVITY_SCORE'),
       minActivityEvidence: positiveInt('DEBOT_MIN_ACTIVITY_EVIDENCE'),
       minVolumeAcceleration: positive('DEBOT_MIN_VOLUME_ACCELERATION'),
+      minLiquidityUsd: nonNegative('DEBOT_MIN_LIQUIDITY_USD'),
       require1m: booleanEnv('DEBOT_REQUIRE_1M'),
       include1mOnly: booleanEnv('DEBOT_INCLUDE_1M_ONLY'),
       accelerationSaturation: positive('DEBOT_ACCELERATION_SATURATION'),

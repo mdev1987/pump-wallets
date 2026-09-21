@@ -107,6 +107,12 @@ export type PumpWindow = {
   sellCount: number;
   /** True when window netBuy <= 0: distribution top, not accumulation-led. Not persisted to DuckDB (JSON only). */
   isDistribution?: boolean;
+  /**
+   * True when peakReturn exceeds MAX_PUMP_PEAK_RETURN: economically absurd,
+   * almost certainly reconstructed-price contamination (SH55 pattern).
+   * Excluded from wallet attribution like distribution; JSON only.
+   */
+  isAbsurd?: boolean;
 };
 
 export type BuyAttribution = {
@@ -541,6 +547,9 @@ export type DetailedParseResult = {
 export function parseTradesFromTransactionDetailed(
   transaction: RawTransaction,
   tokenAddress: string,
+  // Minimum token movement in base units. Stays a parameter (not CONFIG) so
+  // the parser remains deterministic without analyzer configuration.
+  minTokenBaseUnits = 1000,
 ): DetailedParseResult {
   if (transaction.blockTime === null) {
     return { trades: [], reason: 'missing_block_time' };
@@ -570,6 +579,7 @@ export function parseTradesFromTransactionDetailed(
   let sawSignerWallet = false;
   let sawWalletBalance = false;
   let sawSolDelta = false;
+  let sawDustTokenDelta = false;
   let sawDirectionMismatch = false;
   let sawRouterLikeSwap = false;
   let sawInvalidAmount = false;
@@ -622,6 +632,16 @@ export function parseTradesFromTransactionDetailed(
       continue;
     }
 
+    // Dust-token quarantine (SH55 pattern): a handful of base units moving
+    // against real SOL produces economically absurd prices (millions of
+    // SOL/token) that would contaminate buckets, detection and forwards.
+    // Rejected and counted; real trades move orders of magnitude more units.
+    const tokenBaseUnits = token.tokenDelta < 0n ? -token.tokenDelta : token.tokenDelta;
+    if (tokenBaseUnits < BigInt(Math.max(0, Math.floor(minTokenBaseUnits)))) {
+      sawDustTokenDelta = true;
+      continue;
+    }
+
     const tokenAmount = bigintToTokenNumber(
       token.tokenDelta < 0n ? -token.tokenDelta : token.tokenDelta,
       token.decimals,
@@ -656,6 +676,7 @@ export function parseTradesFromTransactionDetailed(
   if (!sawSignerWallet) return { trades: [], reason: 'wallet_not_signer' };
   if (!sawWalletBalance) return { trades: [], reason: 'missing_wallet_sol_balance' };
   if (!sawSolDelta) return { trades: [], reason: 'zero_sol_delta' };
+  if (sawDustTokenDelta) return { trades: [], reason: 'dust_token_delta' };
   if (sawRouterLikeSwap) return { trades: [], reason: 'router_like_swap' };
   if (sawDirectionMismatch) return { trades: [], reason: 'sol_direction_mismatch' };
   if (sawInvalidAmount) return { trades: [], reason: 'invalid_amount' };
@@ -681,6 +702,7 @@ export type ParseDropReason =
   | 'wallet_not_signer'
   | 'missing_wallet_sol_balance'
   | 'zero_sol_delta'
+  | 'dust_token_delta'
   | 'sol_direction_mismatch'
   | 'router_like_swap'
   | 'invalid_amount';
@@ -924,6 +946,25 @@ function findPriceAtOrBefore(
   return answer >= 0 ? buckets[answer]! : null;
 }
 
+/**
+ * Shared coverage primitive: nearest bucket to a target timestamp, or null
+ * when the closest observation is farther than maxDistanceSec. Sparse
+ * selected-history windows leave multi-minute holes; treating a far-away
+ * bucket as "the price at T" invents pump starts, confirmations and labels.
+ */
+function bucketNear(
+  buckets: MarketBucket[],
+  targetTimestamp: number,
+  maxDistanceSec: number,
+  direction: 'before' | 'after',
+): MarketBucket | null {
+  const found = direction === 'before'
+    ? findPriceAtOrBefore(buckets, targetTimestamp)
+    : findPriceAtOrAfter(buckets, targetTimestamp);
+  if (!found || Math.abs(found.timestamp - targetTimestamp) > maxDistanceSec) return null;
+  return found;
+}
+
 function forwardReturnFromTrade(
   trade: Trade,
   buckets: MarketBucket[],
@@ -941,7 +982,8 @@ function forwardReturnFromTrade(
   return future.priceSol / trade.priceSol - 1;
 }
 
-function maxForwardReturnFromTrade(
+/** Exported for regression tests: MFE must refuse sparse horizons, not invent excursions. */
+export function maxForwardReturnFromTrade(
   trade: Trade,
   buckets: MarketBucket[],
   horizonSec: number,
@@ -963,10 +1005,16 @@ function maxForwardReturnFromTrade(
 
   let maxPrice = trade.priceSol;
   let found = false;
+  // Coverage-anchored at the trade itself: any internal hole wider than the
+  // allowance means price action went unobserved, so the maximum over the
+  // surviving buckets is refused rather than presented as the excursion.
+  let prev = trade.timestamp;
 
   for (let i = lo; i < buckets.length; i += 1) {
     const bucket = buckets[i]!;
     if (bucket.timestamp > end) break;
+    if (bucket.timestamp - prev > CONFIG.coverageMaxGapSec) return null;
+    prev = bucket.timestamp;
     maxPrice = Math.max(maxPrice, bucket.priceSol);
     found = true;
   }
@@ -1046,13 +1094,17 @@ function detectPumpCandidates(
     const now = buckets[i]!;
 
     // Fast vertical move: retains the original scalp-oriented detector.
-    const fastLookback = findPriceAtOrBefore(buckets, now.timestamp - CONFIG.pumpLookbackSec);
-    const fastConfirm = findPriceAtOrAfter(buckets, now.timestamp + CONFIG.pumpConfirmSec);
+    // All reference prices are coverage-bounded: a far-away bucket is not
+    // "the price 15s ago", and using it would invent acceleration events.
+    const fastLookback = bucketNear(buckets, now.timestamp - CONFIG.pumpLookbackSec, CONFIG.coverageMaxGapSec, 'before');
+    const fastConfirm = bucketNear(buckets, now.timestamp + CONFIG.pumpConfirmSec, CONFIG.coverageMaxGapSec, 'after');
     if (fastLookback && fastConfirm) {
       const lookbackReturn = now.priceSol / fastLookback.priceSol - 1;
-      const previousLookback = findPriceAtOrBefore(
+      const previousLookback = bucketNear(
         buckets,
         fastLookback.timestamp - CONFIG.pumpLookbackSec,
+        CONFIG.coverageMaxGapSec,
+        'before',
       );
       const priorReturn = previousLookback
         ? fastLookback.priceSol / previousLookback.priceSol - 1
@@ -1096,8 +1148,8 @@ function detectPumpCandidates(
     }
 
     // Sustained move: catches slower grinds that do not reach the fast gate.
-    const sustainedLookback = findPriceAtOrBefore(buckets, now.timestamp - CONFIG.pumpSustainedLookbackSec);
-    const sustainedConfirm = findPriceAtOrAfter(buckets, now.timestamp + CONFIG.pumpSustainedConfirmSec);
+    const sustainedLookback = bucketNear(buckets, now.timestamp - CONFIG.pumpSustainedLookbackSec, CONFIG.coverageMaxGapSec, 'before');
+    const sustainedConfirm = bucketNear(buckets, now.timestamp + CONFIG.pumpSustainedConfirmSec, CONFIG.coverageMaxGapSec, 'after');
     if (!sustainedLookback || !sustainedConfirm) continue;
 
     const sustainedReturn = now.priceSol / sustainedLookback.priceSol - 1;
@@ -1158,12 +1210,15 @@ function buildPumpWindows(
   if (!candidates.length) return [];
 
   const windows: PumpWindow[] = [];
-  let clusterStart = candidates[0]!;
-  let clusterCandidates: PumpCandidate[] = [clusterStart];
+  let clusterCandidates: PumpCandidate[] = [candidates[0]!];
 
   const flush = (): void => {
     const start = clusterCandidates[0]!;
-    const endTimestamp = start.timestamp + CONFIG.pumpWindowSec;
+    // The window spans the whole chain: a transitively-joined cluster ends
+    // one window-length after its LAST candidate, otherwise later ramps'
+    // trades and wallets would be orphaned outside their own pump window.
+    const last = clusterCandidates[clusterCandidates.length - 1]!;
+    const endTimestamp = last.timestamp + CONFIG.pumpWindowSec;
     const end = findPriceAtOrBefore(buckets, endTimestamp) ?? buckets.at(-1);
     if (!end) return;
 
@@ -1213,6 +1268,13 @@ function buildPumpWindows(
       0,
     );
 
+    const peakReturn = peak.priceSol / start.priceSol - 1;
+    // Absurd on either leg: escalation INSIDE the window, or the entry jump
+    // that seeded it (a 5000x step between adjacent buckets is
+    // reconstructed-price contamination or untradeable lottery noise — either
+    // way it must not train wallet leadership).
+    const entryJump = clusterCandidates[0]!.lookbackReturn;
+    const absurd = peakReturn > CONFIG.maxPumpPeakReturn || entryJump > CONFIG.maxPumpPeakReturn;
     windows.push({
       id: windows.length + 1,
       startTimestamp: start.timestamp,
@@ -1222,7 +1284,7 @@ function buildPumpWindows(
       startPriceSol: start.priceSol,
       peakPriceSol: peak.priceSol,
       peakTimestamp: peak.timestamp,
-      peakReturn: peak.priceSol / start.priceSol - 1,
+      peakReturn,
       max15sReturn: max15,
       max30sReturn: max30,
       netBuySol: metrics.netBuySol,
@@ -1231,20 +1293,25 @@ function buildPumpWindows(
       buyCount: metrics.buyCount,
       sellCount: metrics.sellCount,
       isDistribution: metrics.netBuySol <= 0,
+      isAbsurd: absurd,
     });
 
   };
 
+  // Transitive clustering on CONSECUTIVE gaps: 0s, 100s, 200s with a 120s
+  // cluster window is one chain, not three windows. Anchoring on the cluster
+  // start instead would split chains and inflate recurrence statistics.
+  let previousCandidate = candidates[0]!;
   for (let i = 1; i < candidates.length; i += 1) {
     const candidate = candidates[i]!;
 
-    if (candidate.timestamp - clusterStart.timestamp <= CONFIG.pumpClusterSec) {
+    if (candidate.timestamp - previousCandidate.timestamp <= CONFIG.pumpClusterSec) {
       clusterCandidates.push(candidate);
     } else {
       flush();
-      clusterStart = candidate;
       clusterCandidates = [candidate];
     }
+    previousCandidate = candidate;
   }
 
   flush();
@@ -1550,17 +1617,17 @@ function buildWalletPumpObservations(
 ): WalletPumpObservation[] {
   const groups = new Map<string, BuyAttribution[]>();
   const baselineByPump = new Map(controlBaselines.map((item) => [item.pumpId, item]));
-  // Distribution tops (netBuy <= 0) are violent price events, not buy-driven
-  // pumps. Leading one earns no leadership credit: excluded from wallet x pump
-  // observations and leaders. Windows, controls and pumpBuyEvents keep them
-  // for forensics.
-  const distributionPumpIds = new Set(
-    pumpWindows.filter((pump) => pump.isDistribution).map((pump) => pump.id),
+  // Distribution tops (netBuy <= 0) and absurd windows (peak beyond
+  // MAX_PUMP_PEAK_RETURN, i.e. reconstructed-price contamination) earn no
+  // leadership credit: excluded from wallet x pump observations and leaders.
+  // Windows, controls and pumpBuyEvents keep them for forensics.
+  const excludedPumpIds = new Set(
+    pumpWindows.filter((pump) => pump.isDistribution || pump.isAbsurd).map((pump) => pump.id),
   );
 
   for (const item of attributions) {
     if (item.leadPumpId === null || item.entryEvidenceScore <= 0) continue;
-    if (distributionPumpIds.has(item.leadPumpId)) continue;
+    if (excludedPumpIds.has(item.leadPumpId)) continue;
     if (item.trade.solAmount < CONFIG.minLeaderTradeSol) continue;
     if (item.secondsFromPumpStart === null || item.secondsFromPumpStart >= CONFIG.earlyPumpSec) continue;
 
@@ -1700,32 +1767,35 @@ function buildWalletPumpObservations(
       controlPositive15Rate: control.positive15Rate,
       controlPositive30Rate: control.positive30Rate,
       controlPositive60Rate: control.positive60Rate,
+      // Control-adjusted outcomes exist ONLY on a sufficient baseline.
+      // Without one they are NULL (raw control counts stay for diagnostics);
+      // otherwise weak controls masquerade as valid counterfactuals.
       excessForward5Median:
-        forward5Median !== null && control.forward5Median !== null
+        controlSufficient && forward5Median !== null && control.forward5Median !== null
           ? forward5Median - control.forward5Median
           : null,
       excessForward15Median:
-        forward15Median !== null && control.forward15Median !== null
+        controlSufficient && forward15Median !== null && control.forward15Median !== null
           ? forward15Median - control.forward15Median
           : null,
       excessForward30Median:
-        forward30Median !== null && control.forward30Median !== null
+        controlSufficient && forward30Median !== null && control.forward30Median !== null
           ? forward30Median - control.forward30Median
           : null,
       excessForward60Median:
-        forward60Median !== null && control.forward60Median !== null
+        controlSufficient && forward60Median !== null && control.forward60Median !== null
           ? forward60Median - control.forward60Median
           : null,
       positive15Lift:
-        positive15 !== null && control.positive15Rate !== null
+        controlSufficient && positive15 !== null && control.positive15Rate !== null
           ? positive15 - control.positive15Rate
           : null,
       positive30Lift:
-        positive30 !== null && control.positive30Rate !== null
+        controlSufficient && positive30 !== null && control.positive30Rate !== null
           ? positive30 - control.positive30Rate
           : null,
       positive60Lift:
-        positive60 !== null && control.positive60Rate !== null
+        controlSufficient && positive60 !== null && control.positive60Rate !== null
           ? positive60 - control.positive60Rate
           : null,
     });
@@ -1844,17 +1914,22 @@ function summarizeWallets(
         ).length / pumpObservations.length
       : null;
 
-    const controlAdjusted30PumpPositiveCount = pumpObservations.filter(
+    // Control-adjusted rates run ONLY over control-sufficient observations.
+    // Dividing by all pumps (or shrinking toward the prior with zero backed
+    // observations, which previously scored a phantom 0.5) pretends weak
+    // controls are valid counterfactuals.
+    const backedObservations = pumpObservations.filter((item) => item.controlSufficient);
+    const controlAdjusted30PumpPositiveCount = backedObservations.filter(
       (item) =>
         item.excessForward30Median !== null &&
         item.excessForward30Median > 0,
     ).length;
-    const controlAdjusted30PumpRate = pumpObservations.length
-      ? controlAdjusted30PumpPositiveCount / pumpObservations.length
+    const controlAdjusted30PumpRate = backedObservations.length
+      ? controlAdjusted30PumpPositiveCount / backedObservations.length
       : null;
-    const reliabilityAdjusted30PumpRate = pumpObservations.length
+    const reliabilityAdjusted30PumpRate = backedObservations.length
       ? (controlAdjusted30PumpPositiveCount + 0.5 * CONFIG.reliabilityPriorPumps) /
-        (pumpObservations.length + CONFIG.reliabilityPriorPumps)
+        (backedObservations.length + CONFIG.reliabilityPriorPumps)
       : null;
 
     const totalEntryEvidenceScore = pumpObservations.reduce(
@@ -2084,13 +2159,13 @@ function summarizeWallets(
 export function selectStrongestPump(pumpWindows: PumpWindow[]): PumpWindow | null {
   if (!pumpWindows.length) return null;
 
-  // Prefer accumulation-led pumps (netBuy > 0). A distribution top with
-  // negative netBuy (e.g. pump 5 live: -2.5 SOL, +267%) must not outrank a
-  // genuine accumulation pump on peakReturn alone.
+  // Prefer accumulation-led, sane pumps. Distribution tops and absurd
+  // reconstructed-price windows (e.g. +2.6Mx on dust amounts) must not
+  // outrank a genuine accumulation pump on peakReturn alone.
   return [...pumpWindows].sort(
     (a, b) => {
-      const aDist = a.netBuySol <= 0 ? 1 : 0;
-      const bDist = b.netBuySol <= 0 ? 1 : 0;
+      const aDist = a.netBuySol <= 0 || a.isAbsurd ? 1 : 0;
+      const bDist = b.netBuySol <= 0 || b.isAbsurd ? 1 : 0;
       return (
         aDist - bDist ||
         b.peakReturn - a.peakReturn ||

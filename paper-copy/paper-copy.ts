@@ -60,7 +60,12 @@ const BREAKER_SWEEP_ERRORS = 8;
 const BREAKER_PAUSE_MS = 30 * 60_000;
 
 type State = {
-  balanceSol: number;
+  // Core accounting: cash + positions = equity invariant
+  cashSol: number;                    // Free cash available for new positions
+  reservedSol: number;                // Cash reserved for open positions (cost basis + fees)
+  realizedPnlSol: number;             // Cumulative realized PnL from closed positions
+  unrealizedPnlSol: number;           // Current unrealized PnL on open positions
+  
   positions: Position[];
   closed: Array<{ id: string; mint: string; symbol: string; pnlSol: number; win: boolean; atMs: number }>;
   lastSig: Record<string, string>;
@@ -91,9 +96,30 @@ async function loadState(): Promise<State> {
     const s = JSON.parse(await readFile(STATE_PATH, 'utf8')) as State;
     s.mintBuyers ??= {};
     s.opensToday ??= {};
+    // Migration from old single balance to new accounting
+    if (s.balanceSol !== undefined && s.cashSol === undefined) {
+      s.cashSol = s.balanceSol;
+      s.reservedSol = 0;
+      s.realizedPnlSol = 0;
+      s.unrealizedPnlSol = 0;
+      delete (s as any).balanceSol;
+    }
+    s.mintBuyers ??= {};
+    s.opensToday ??= {};
     return s;
   } catch {
-    return { balanceSol: START_BALANCE_SOL, positions: [], closed: [], lastSig: {}, cooldownUntil: {}, mintBuyers: {}, opensToday: {} };
+    return { 
+      cashSol: START_BALANCE_SOL, 
+      reservedSol: 0, 
+      realizedPnlSol: 0, 
+      unrealizedPnlSol: 0,
+      positions: [], 
+      closed: [], 
+      lastSig: {}, 
+      cooldownUntil: {}, 
+      mintBuyers: {}, 
+      opensToday: {} 
+    };
   }
 }
 
@@ -365,8 +391,8 @@ async function main(): Promise<void> {
     return { closed: state.closed.length, wins, totalPnlSol: state.closed.reduce((s, c) => s + c.pnlSol, 0) };
   };
 
-  await send(startupReport(cfg, tracked.length, state.balanceSol));
-  console.log(`paper-copy live: ${tracked.length} wallets, balance ${state.balanceSol} SOL`);
+  await send(startupReport(cfg, tracked.length, state.cashSol, state.reservedSol, state.unrealizedPnlSol));
+  console.log(`paper-copy live: ${tracked.length} wallets, cash ${state.cashSol.toFixed(4)} | reserved ${state.reservedSol.toFixed(4)} | unrealized ${state.unrealizedPnlSol.toFixed(4)} | equity ${(state.cashSol + state.reservedSol + state.unrealizedPnlSol).toFixed(4)}`);
 
   const priceTick = async (): Promise<void> => {
     const open = state.positions.filter((p) => p.status === 'open');
@@ -378,24 +404,59 @@ async function main(): Promise<void> {
       console.warn('price tick failed', String(e).slice(0, 120));
       return;
     }
-    const now = Date.now();
+    let totalUnrealized = 0;
+    for (const pos of open) {
+      const px = info.get(pos.mint)?.priceUsd;
+      if (!px) continue;
+      // Update unrealized PnL
+      const currentValue = pos.qtyTokens * px * (pos.solUsdAtEntry / pos.entryPriceUsd);
+      const costBasis = pos.sizeSol;
+      const unrealized = currentValue - costBasis;
+      pos.unrealizedPnlSol = unrealized;
+    }
+    let totalUnrealized = state.positions
+      .filter((p) => p.status === 'open')
+      .reduce((sum, p) => sum + p.unrealizedPnlSol, 0);
+    const equity = state.cashSol + state.reservedSol + state.unrealizedPnlSol;
+    const expectedEquity = START_BALANCE_SOL + state.realizedPnlSol + totalUnrealized;
+    if (Math.abs(equity - expectedEquity) > 0.001) {
+      console.warn(`EQUITY DRIFT: equity=${equity.toFixed(4)} expected=${expectedEquity.toFixed(4)}`);
+    }
     let dirty = false;
+    const now = Date.now();
     for (const pos of open) {
       const px = info.get(pos.mint)?.priceUsd;
       if (!px) continue;
       const ev = tickPosition(cfg, pos, px, now);
       for (const leg of ev.partials) {
-        state.balanceSol += (leg.qtyTokens / pos.qtyTokens) * cfg.posSizeSol * (leg.priceUsd / pos.entryPriceUsd) - cfg.feeLegSol;
+        // Partial TP: reduce position, realize proceeds, adjust cost basis
+        const proceeds = (leg.qtyTokens / pos.qtyTokens) * pos.sizeSol * (leg.priceUsd / pos.entryPriceUsd);
+        const fee = cfg.feeLegSol;
+        const cashBefore = state.cashSol;
+        const reservedBefore = state.reservedSol;
+        state.cashSol += proceeds - fee;
+        state.reservedSol -= (leg.qtyTokens / pos.qtyTokens) * (pos.sizeSol + pos.feeOpenSol);
+        pos.qtyTokens -= leg.qtyTokens;
+        state.realizedPnlSol += leg.pnlSol;
+        pos.unrealizedPnlSol = 0; // will be recalculated on next price tick
         dirty = true;
+        const cashAfter = state.cashSol;
+        const reservedAfter = state.reservedSol;
+        pos.cashBeforeSol = cashBefore;
+        pos.cashAfterSol = cashAfter;
+        pos.reservedAfterSol = reservedBefore;
         await send(partialReport(cfg, pos, leg, solUsdCache));
-      }
       if (ev.closed) {
         const last = pos.legs.at(-1)!;
-        state.balanceSol += (last.qtyTokens / pos.qtyTokens) * cfg.posSizeSol * (last.priceUsd / pos.entryPriceUsd) - cfg.feeLegSol;
-        const pnl = positionPnlSol(pos) - cfg.feeOpenSol;
-        state.closed.push({ id: pos.id, mint: pos.mint, symbol: pos.symbol, pnlSol: pnl, win: pnl > 0, atMs: now });
+        const proceeds = (last.qtyTokens / pos.qtyTokens) * pos.sizeSol * (last.priceUsd / pos.entryPriceUsd);
+        state.cashSol += proceeds - cfg.feeLegSol;
+        state.reservedSol -= pos.sizeSol + pos.feeOpenSol;
+        state.realizedPnlSol += pos.pnlSol - pos.feeOpenSol;
+        state.unrealizedPnlSol = 0;
+        state.closed.push({ id: pos.id, mint: pos.mint, symbol: pos.symbol, pnlSol: pos.pnlSol - pos.feeOpenSol, win: pos.pnlSol > pos.feeOpenSol, atMs: now });
+        pos.status = 'closed';
         dirty = true;
-        await send(closeReport(cfg, pos, state.balanceSol, solUsdCache, stats()));
+        await send(closeReport(cfg, pos, state.cashSol, solUsdCache, stats()));
       }
     }
     if (dirty) await saveState(state);
@@ -483,7 +544,8 @@ async function main(): Promise<void> {
             ageHours: info.ageHours,
             rugScore: rug,
           });
-          state.balanceSol -= cfg.posSizeSol + cfg.feeOpenSol;
+          state.cashSol -= cfg.posSizeSol + cfg.feeOpenSol;
+          state.reservedSol += cfg.posSizeSol + cfg.feeOpenSol;
           state.positions.push(pos);
           state.cooldownUntil[`${t.wallet}:${b.mint}`] = Date.now() + ENTRY_COOLDOWN_MS;
           walletDayRecord(state.opensToday, t.wallet, Date.now());

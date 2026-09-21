@@ -198,10 +198,10 @@ describe("paper engine lifecycle", () => {
     const p = mkPos(2.0);
     tickPosition(cfg, p, 2.6, 1000);
     const stats = { closed: 3, wins: 2, totalPnlSol: 0.05 };
-    const o = openReport(cfg, p, 9.95, 100);
+    const o = openReport(cfg, p, 9.95, 0.05, 100);
     const stats0 = { closed: 3, wins: 2, totalPnlSol: 0.05 };
     const c = closeReport(cfg, { ...p, status: 'closed' as const, closeReason: 'TP +40% (ladder complete)', legs: [...p.legs, { kind: 'tp' as const, label: 'TP +40% (ladder complete)', priceUsd: 3.0, qtyTokens: p.remainingQty, pnlSol: 0.02, atMs: 2000 }] }, 10.0, 100, stats0);
-    const s = startupReport(cfg, 12, 10);
+    const s = startupReport(cfg, 12, 10, 0, 0);
     for (const t of [o, c, s]) {
       expect(typeof t).toBe("string");
       expect(t.length).toBeGreaterThan(50);

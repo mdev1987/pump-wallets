@@ -44,6 +44,7 @@ export type DeBotClientConfig = {
   minActivityScore: number;
   minActivityEvidence: number;
   minVolumeAcceleration: number;
+  minLiquidityUsd: number;
   require1m: boolean;
   include1mOnly: boolean;
 
@@ -320,6 +321,7 @@ export type DeBotPumpCandidateDiagnostics = {
   scored: number;
   evidencePassed: number;
   volumePassed: number;
+  liquidityPassed: number;
   positiveEvidencePassed: number;
   heatmapPassed: number;
   finalCandidates: number;
@@ -656,6 +658,11 @@ function buildSignal(
     : null;
   const volumeAcceleration = paceRatio(volume1m, volume5m);
   const walletAcceleration = paceRatio(uniqueWalletSwaps1m, uniqueWalletSwaps5m);
+  const liquidity = numberOrNull(primary?.pair_summary_info?.liquidity);
+  // Hard safety floor (not a quality verdict): dust-book tokens waste Helius
+  // budget and breed pathological price data. Unknown liquidity never passes
+  // when the floor is positive.
+  const liquidityGatePassed = liquidity !== null && liquidity >= config.minLiquidityUsd;
   const attachedHeatmap = attachHeatmapMeta(heatmapContext, metaSignal);
 
   const activity = buildActivityScore(
@@ -687,6 +694,7 @@ function buildSignal(
     pump.evidenceCount >= config.minPumpPrecursorEvidence &&
     pump.volume !== null &&
     volumeGatePassed &&
+    liquidityGatePassed &&
     pump.positiveEvidenceCount >= config.minPumpPrecursorPositiveEvidence &&
     (!config.requireHeatmap || (attachedHeatmap.heatmapSeen && heatmapRecent));
 
@@ -697,6 +705,7 @@ function buildSignal(
   if (pump.buyPressureDelta !== null && pump.buyPressureDelta > 0) candidateReasons.push(`buy-delta +${(pump.buyPressureDelta * 100).toFixed(1)}pp`);
   if (volumeAcceleration !== null && volumeAcceleration > 1) candidateReasons.push(`volume ${volumeAcceleration.toFixed(2)}x`);
   if (volumeAcceleration !== null && volumeAcceleration <= config.minVolumeAcceleration) candidateReasons.push(`volume-gate ${volumeAcceleration.toFixed(2)}x`);
+  if (!liquidityGatePassed) candidateReasons.push(`liquidity-gate ${liquidity === null ? 'unknown' : `$${liquidity.toFixed(0)}`}`);
   if (walletAcceleration !== null && walletAcceleration > 1) candidateReasons.push(`wallets ${walletAcceleration.toFixed(2)}x`);
   if (attachedHeatmap.heatmapSeen) candidateReasons.push(heatmapRecent ? "heatmap-recent" : "heatmap-stale");
   if (heatmapScore !== null && heatmapScore === 0) candidateReasons.push("heatmap-outside-recent-window");
@@ -743,7 +752,7 @@ function buildSignal(
     buyPressureDelta1mMinus5m: buyPressureDelta,
     volumeAcceleration,
     walletAcceleration,
-    liquidity: numberOrNull(primary?.pair_summary_info?.liquidity),
+    liquidity,
     holders: numberOrNull(primaryMarket.holders),
     marketCap: numberOrNull(primaryMarket.mkt_cap),
     fdv: numberOrNull(primaryMarket.fdv),
@@ -810,6 +819,7 @@ export class DeBotClient {
     if (!Number.isInteger(config.minPumpPrecursorPositiveEvidence) || config.minPumpPrecursorPositiveEvidence < 0) throw new Error("minPumpPrecursorPositiveEvidence must be >= 0");
     if (!Number.isFinite(config.minActivityScore) || config.minActivityScore < 0 || config.minActivityScore > 100) throw new Error("minActivityScore must be 0..100");
     if (!Number.isInteger(config.minActivityEvidence) || config.minActivityEvidence <= 0) throw new Error("minActivityEvidence must be > 0");
+    if (!Number.isFinite(config.minLiquidityUsd) || config.minLiquidityUsd < 0) throw new Error("minLiquidityUsd must be >= 0");
     if (!Object.values(config.scoreWeights).every((value) => Number.isFinite(value) && value >= 0)) throw new Error("score weights must be non-negative finite numbers");
     if (config.scoreWeights.activityRank1m + config.scoreWeights.activityRank5m + config.scoreWeights.activityIntensity <= 0) throw new Error("activity score weights must contain a positive weight");
     if (config.scoreWeights.buyPressure1m + config.scoreWeights.buyPressureDelta + config.scoreWeights.volumeAcceleration + config.scoreWeights.walletAcceleration <= 0) throw new Error("pump score weights must contain a positive weight");
@@ -917,6 +927,7 @@ export class DeBotClient {
     let scored = 0;
     let evidencePassed = 0;
     let volumePassed = 0;
+    let liquidityPassed = 0;
     let positiveEvidencePassed = 0;
     let heatmapPassed = 0;
     let finalCandidates = 0;
@@ -937,6 +948,9 @@ export class DeBotClient {
       if (signal.volumeAcceleration === null || signal.volumeAcceleration <= this.config.minVolumeAcceleration) continue;
       volumePassed += 1;
 
+      if (signal.liquidity === null || signal.liquidity < this.config.minLiquidityUsd) continue;
+      liquidityPassed += 1;
+
       if (signal.pumpPrecursorPositiveEvidenceCount < this.config.minPumpPrecursorPositiveEvidence) continue;
       positiveEvidencePassed += 1;
 
@@ -956,6 +970,7 @@ export class DeBotClient {
       scored,
       evidencePassed,
       volumePassed,
+      liquidityPassed,
       positiveEvidencePassed,
       heatmapPassed,
       finalCandidates,
@@ -1088,6 +1103,12 @@ function positiveNumberEnv(name: string): number {
   return value;
 }
 
+function nonNegativeNumberEnv(name: string): number {
+  const value = Number(requiredEnv(name));
+  if (!Number.isFinite(value) || value < 0) throw new Error(`${name} must be >= 0`);
+  return value;
+}
+
 function boundedPercentEnv(name: string): number {
   const value = Number(requiredEnv(name));
   if (!Number.isFinite(value) || value < 0 || value > 100) throw new Error(`${name} must be between 0 and 100`);
@@ -1117,6 +1138,7 @@ export function loadDeBotClientFromEnv(): DeBotClient {
     minActivityScore: boundedPercentEnv("DEBOT_MIN_ACTIVITY_SCORE"),
     minActivityEvidence: positiveIntEnv("DEBOT_MIN_ACTIVITY_EVIDENCE"),
     minVolumeAcceleration: positiveNumberEnv("DEBOT_MIN_VOLUME_ACCELERATION"),
+    minLiquidityUsd: nonNegativeNumberEnv("DEBOT_MIN_LIQUIDITY_USD"),
     require1m: booleanEnv("DEBOT_REQUIRE_1M"),
     include1mOnly: booleanEnv("DEBOT_INCLUDE_1M_ONLY"),
     accelerationSaturation: positiveNumberEnv("DEBOT_ACCELERATION_SATURATION"),

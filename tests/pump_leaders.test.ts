@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   analyzeToken,
+  maxForwardReturnFromTrade,
   parseTradesFromTransactionDetailed,
   type FetchResult,
   type RawTransaction,
@@ -16,7 +17,7 @@ const baseConfig = {
   minQuietWindowTransactions: 0, quietSearchStartSec: 60, quietSearchEndSec: 120, quietWindowContextSec: 0,
   fineActivityBucketSec: 30, maxFullTransactionsPerWindow: 1000, maxFullQueryWindows: 10, heliusCacheEnabled: false,
   heliusCacheDir: "./data/cache", heliusLightCacheTtlSec: 0, heliusFullCacheTtlSec: 0, heliusMinIntervalMs: 0, retryAttempts: 1, retryBackoffMs: 1,
-  minMarketTradeSol: 0.001, minLeaderTradeSol: 0.01, bucketSec: 1, pumpLookbackSec: 5, pumpAccelReturn: 0.09,
+  minMarketTradeSol: 0.001, minLeaderTradeSol: 0.01, bucketSec: 1, minTokenBaseUnits: 1000, maxPumpPeakReturn: 1000, coverageMaxGapSec: 5, pumpLookbackSec: 5, pumpAccelReturn: 0.09,
   pumpConfirmSec: 5, pumpConfirmReturn: 0.02, pumpMinBuySol: 0.01, pumpBaselineSec: 30, pumpMinVolumePace: 1, pumpMinBuyPressure: 0.5,
   pumpSustainedLookbackSec: 30, pumpSustainedReturn: 0.12, pumpSustainedConfirmSec: 10, pumpSustainedConfirmReturn: 0.02,
   pumpSustainedMinBuySol: 0.01, pumpSustainedMinVolumePace: 1, pumpSustainedMinBuyPressure: 0.5,
@@ -125,9 +126,11 @@ function mkTrade(wallet: string, timestamp: number, priceSol: number, solAmount 
 
 function scenarioTrades(extra: Trade[] = []): Trade[] {
   const trades: Trade[] = [];
-  // Baseline buys every 2s from T0-400 to T0-41 (control window + baseline).
+  // Dense baseline every 2s from T0-400 right up to the ramp. A pre-pump
+  // silence hole is precisely the sparse pattern the coverage guard refuses,
+  // so the covered-market scenarios must not contain one.
   let i = 0;
-  for (let t = T0 - 400; t <= T0 - 41; t += 2) {
+  for (let t = T0 - 400; t <= T0 - 1; t += 2) {
     trades.push(mkTrade("base", t, 1.0, 0.02, "buy", i++));
   }
   // Pre-pump buyer: 1 SOL 40s before the pump start.
@@ -148,7 +151,7 @@ function fetchShell(trades: Trade[]): FetchResult {
   const drop = {
     accepted_transactions: 0, accepted_trades: 0, failed_transaction: 0, missing_block_time: 0,
     missing_signature: 0, no_token_balance: 0, token_delta_zero: 0, wallet_not_signer: 0,
-    missing_wallet_sol_balance: 0, zero_sol_delta: 0, sol_direction_mismatch: 0, router_like_swap: 0, invalid_amount: 0,
+    missing_wallet_sol_balance: 0, zero_sol_delta: 0, dust_token_delta: 0, sol_direction_mismatch: 0, router_like_swap: 0, invalid_amount: 0,
   };
   return {
     trades, pages: 1, transactionsReturned: trades.length, firstBlockTime: null, lastBlockTime: null, truncated: false,
@@ -215,5 +218,124 @@ describe("prospective ranking (no lookahead)", () => {
     const fwdAfter = chaserAfter.map((e) => e.forward30);
     expect(fwdBefore.every((v) => v === null)).toBe(true);
     expect(fwdAfter.some((v) => v !== null)).toBe(true);
+  });
+});
+
+describe("data-integrity guards (P0)", () => {
+  test("dust token amounts quarantine instead of pricing (SH55 pattern)", () => {
+    // 1 base unit (6 decimals) against 0.5 SOL: the exact phantom-price shape.
+    const dust = parseTradesFromTransactionDetailed(
+      rawTx({ wallet: "dust", solDelta: -500_000_000, tokenDelta: "1" }),
+      "TOKEN",
+      1000,
+    );
+    expect(dust.trades).toHaveLength(0);
+    expect(dust.reason).toBe("dust_token_delta");
+    // A real-size move passes the same gate.
+    const real = parseTradesFromTransactionDetailed(
+      rawTx({ wallet: "real", solDelta: -500_000_000, tokenDelta: "1000000" }),
+      "TOKEN",
+      1000,
+    );
+    expect(real.trades).toHaveLength(1);
+  });
+
+  test("sparse confirmation refuses the pump instead of inventing it", () => {
+    // Ramp fires, then silence: the 5s confirmation target has no bucket
+    // within the coverage allowance, so no pump start may be declared.
+    const trades: Trade[] = [];
+    let i = 0;
+    for (let t = T0 - 60; t <= T0 - 1; t += 2) trades.push(mkTrade("base", t, 1.0, 0.02, "buy", i++));
+    [1.0, 1.05, 1.1, 1.15, 1.2, 1.3].forEach((p, k) => trades.push(mkTrade(`r${k}`, T0 + k, p, 0.5, "buy", i++)));
+    const res = analyzeToken(baseConfig, "TOKEN", fetchShell(trades.sort((a, b) => a.timestamp - b.timestamp)), { runId: "t", scanStartedAt: "t" });
+    expect(res.market.pumpWindows).toBe(0);
+  });
+
+  test("MFE refuses sparse horizons instead of inventing excursions", () => {
+    const trade = mkTrade("W", 1000, 1.0, 1.0, "buy", 0);
+    const buckets = [
+      { timestamp: 1000, priceSol: 1.0, buySol: 1, sellSol: 0, netBuySol: 1, buyCount: 1, sellCount: 0, tradeCount: 1 },
+      { timestamp: 1100, priceSol: 2.0, buySol: 1, sellSol: 0, netBuySol: 1, buyCount: 1, sellCount: 0, tradeCount: 1 },
+    ];
+    // 100s hole inside a 30s horizon: refuse.
+    expect(maxForwardReturnFromTrade(trade, buckets as never, 30)).toBeNull();
+    const dense = [];
+    for (let t = 1000; t <= 1030; t += 1) {
+      dense.push({ timestamp: t, priceSol: 1 + (t - 1000) * 0.01, buySol: 1, sellSol: 0, netBuySol: 1, buyCount: 1, sellCount: 0, tradeCount: 1 });
+    }
+    const r = maxForwardReturnFromTrade(trade, dense as never, 30);
+    expect(r).not.toBeNull();
+    expect(r!).toBeGreaterThan(0.2);
+  });
+
+  test("0s, 100s, 200s acceleration chain clusters transitively into one window", () => {
+    const trades: Trade[] = [];
+    let i = 0;
+    // Long quiet baseline so each ramp sees a flat lookback.
+    for (let t = T0 - 400; t <= T0 - 1; t += 2) trades.push(mkTrade("base", t, 1.0, 0.02, "buy", i++));
+    for (const start of [T0, T0 + 100, T0 + 200]) {
+      [1.0, 1.05, 1.1, 1.15, 1.2, 1.3].forEach((p, k) => trades.push(mkTrade(`r${start}-${k}`, start + k, p, 0.5, "buy", i++)));
+      // Flat confirmation shelf so the confirm gate sees the level hold.
+      for (let t = start + 6; t <= start + 25; t += 1) {
+        trades.push(mkTrade("shelf", t, 1.3, 0.05, "buy", i++));
+      }
+      // Gentle decay back to 1.0 so the next ramp accelerates from flat.
+      for (let t = start + 26; t < start + 95; t += 2) {
+        const f = 1 - (t - (start + 26)) / 69;
+        trades.push(mkTrade("decay", t, 1.3 - 0.3 * (1 - f), 0.01, "sell", i++));
+      }
+    }
+    const res = analyzeToken(baseConfig, "TOKEN", fetchShell(trades.sort((a, b) => a.timestamp - b.timestamp)), { runId: "t", scanStartedAt: "t" });
+    expect(res.market.pumpStarts).toBeGreaterThanOrEqual(3);
+    expect(res.market.pumpWindows).toBe(1);
+    expect(res.pumpWindows[0]!.endTimestamp - res.pumpWindows[0]!.startTimestamp).toBeGreaterThan(150);
+  });
+
+  test("insufficient controls NULL the adjusted metrics (never 0.5 prior, never blended rates)", () => {
+    // History starts just before the pump: control window is empty.
+    const trades: Trade[] = [];
+    let i = 0;
+    for (let t = T0 - 100; t <= T0 - 1; t += 2) trades.push(mkTrade("base", t, 1.0, 0.02, "buy", i++));
+    trades.push(mkTrade("LONE", T0 - 10, 1.0, 1.0, "buy", i++));
+    [1.0, 1.05, 1.1, 1.15, 1.2, 1.3].forEach((p, k) => trades.push(mkTrade(`r${k}`, T0 + k, p, 0.5, "buy", i++)));
+    for (let t = T0 + 6; t <= T0 + 35; t += 1) trades.push(mkTrade("flat", t, 1.3, 0.05, "buy", i++));
+    const res = analyzeToken(baseConfig, "TOKEN", fetchShell(trades.sort((a, b) => a.timestamp - b.timestamp)), { runId: "t", scanStartedAt: "t" });
+    expect(res.market.pumpWindows).toBeGreaterThanOrEqual(1);
+    for (const o of res.walletPumpObservations) {
+      expect(o.controlSufficient).toBe(false);
+      expect(o.excessForward30Median).toBeNull();
+      expect(o.positive30Lift).toBeNull();
+    }
+    for (const l of res.walletLeaders) {
+      expect(l.controlAdjustedForward30Median).toBeNull();
+      expect(l.controlAdjusted30PumpRate).toBeNull();
+      expect(l.reliabilityAdjusted30PumpRate).toBeNull();
+      expect(l.reliabilityAdjustedExcessForward30Median).toBeNull();
+      expect(l.predictiveQualified).toBe(false);
+    }
+  });
+
+  test("absurd peak windows are flagged and earn no leadership", () => {
+    const trades: Trade[] = [];
+    let i = 0;
+    for (let t = T0 - 400; t <= T0 - 1; t += 2) trades.push(mkTrade("base", t, 1.0, 0.02, "buy", i++));
+    // Sane pump first (tracked).
+    [1.0, 1.05, 1.1, 1.15, 1.2, 1.3].forEach((p, k) => trades.push(mkTrade(`r${k}`, T0 + k, p, 0.5, "buy", i++)));
+    for (let t = T0 + 6; t <= T0 + 200; t += 1) trades.push(mkTrade("flat", t, 1.3, 0.05, "buy", i++));
+    // Dense baseline into the artifact zone so coverage cannot refuse it:
+    // the absurdity flag (not the coverage guard) must catch this one.
+    for (let t = T0 + 201; t <= T0 + 299; t += 2) trades.push(mkTrade("base2", t, 1.3, 0.02, "buy", i++));
+    // Dense, funded, still-rising artifact ramp: +5000x with real buy flow.
+    for (let t = T0 + 300; t <= T0 + 340; t += 1) {
+      trades.push(mkTrade("WHALE", t, 6500 + (t - (T0 + 300)) * 50, 5.0, "buy", i++));
+    }
+    const res = analyzeToken(baseConfig, "TOKEN", fetchShell(trades.sort((a, b) => a.timestamp - b.timestamp)), { runId: "t", scanStartedAt: "t" });
+    expect(res.market.pumpWindows).toBeGreaterThanOrEqual(2);
+    const absurd = res.pumpWindows.filter((p) => p.isAbsurd);
+    expect(absurd.length).toBeGreaterThanOrEqual(1);
+    const absurdIds = new Set(absurd.map((p) => p.id));
+    expect(res.walletPumpObservations.every((o) => !absurdIds.has(o.pumpId))).toBe(true);
+    // The sane window survives alongside and still attributes leadership.
+    expect(res.pumpWindows.some((p) => !p.isAbsurd && !p.isDistribution)).toBe(true);
   });
 });

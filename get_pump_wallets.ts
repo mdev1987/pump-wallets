@@ -259,6 +259,25 @@ async function exportGlobalViews(db: ResearchDb, config: Config): Promise<void> 
     `SELECT * FROM debot_signals ORDER BY observed_at_sec DESC, pump_precursor_score DESC NULLS LAST, token_ca`,
     `${config.globalExportDir}/debot-signals.csv`,
   );
+  // Prospective watchlist: entry-time, cross-token evidence ONLY. No forward
+  // returns, no excess metrics, no reliability shrinkage — nothing that could
+  // only be known after the fact. The retrospective ranking lives in
+  // wallet-global-summary.csv; row order there must never be read as a
+  // prospective leaderboard.
+  await exportGlobalCsv(
+    db,
+    `SELECT wallet,
+            COUNT(DISTINCT token_ca) AS tokens,
+            SUM(CASE WHEN pre_pump_buy_count > 0 THEN 1 ELSE 0 END) AS pre_pump_windows,
+            SUM(CASE WHEN control_sufficient THEN 1 ELSE 0 END) AS backed_windows,
+            SUM(pre_pump_buy_count) AS pre_pump_buys,
+            SUM(pre_pump_buy_sol) AS pre_pump_sol,
+            SUM(buy_count) AS pump_buys
+       FROM wallet_pump_observations
+       GROUP BY wallet
+       ORDER BY pre_pump_windows DESC, pre_pump_sol DESC, tokens DESC, wallet`,
+    `${config.globalExportDir}/prospective-watchlist.csv`,
+  );
   // Top PnL candidates joined to cross-token evidence. PnL columns are
   // discovery metadata; entry/qualification columns carry the verdict.
   await exportGlobalCsv(
@@ -359,6 +378,8 @@ async function discoverWithDeBot(
     `DeBot candidate gates: 1m=${candidateDiagnostics.require1mPassed}/${candidateDiagnostics.totalSignals} ` +
     `presence=${candidateDiagnostics.presencePassed} scored=${candidateDiagnostics.scored} ` +
     `evidence=${candidateDiagnostics.evidencePassed} volume=${candidateDiagnostics.volumePassed} ` +
+    `liquidity=${candidateDiagnostics.liquidityPassed} ` +
+    `liquidity=${candidateDiagnostics.liquidityPassed} ` +
     `positive=${candidateDiagnostics.positiveEvidencePassed} heatmap=${candidateDiagnostics.heatmapPassed} ` +
     `final=${candidateDiagnostics.finalCandidates}`,
   );
@@ -370,6 +391,8 @@ async function discoverWithDeBot(
     `DeBot gates           : 1m=${candidateDiagnostics.require1mPassed}/${candidateDiagnostics.totalSignals} ` +
     `presence=${candidateDiagnostics.presencePassed} scored=${candidateDiagnostics.scored} ` +
     `evidence=${candidateDiagnostics.evidencePassed} volume=${candidateDiagnostics.volumePassed} ` +
+    `liquidity=${candidateDiagnostics.liquidityPassed} ` +
+    `liquidity=${candidateDiagnostics.liquidityPassed} ` +
     `positive=${candidateDiagnostics.positiveEvidencePassed} final=${candidateDiagnostics.finalCandidates}`,
   );
   if (pumpCandidates.length) {
@@ -403,7 +426,7 @@ async function main(): Promise<void> {
   await rootLogger.info(
     `DeBot config: enabled=${config.debotEnabled} scanCandidates=${config.debotScanCandidates} ` +
     `minScore=${config.debot.minPumpPrecursorScore} minEvidence=${config.debot.minPumpPrecursorEvidence} ` +
-    `minPositive=${config.debot.minPumpPrecursorPositiveEvidence} minVolume=${config.debot.minVolumeAcceleration}`,
+    `minPositive=${config.debot.minPumpPrecursorPositiveEvidence} minVolume=${config.debot.minVolumeAcceleration} minLiq=${config.debot.minLiquidityUsd}`,
   );
 
   const db = await ResearchDb.open(config, rootLogger);

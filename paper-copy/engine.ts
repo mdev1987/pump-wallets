@@ -69,6 +69,12 @@ export type Position = {
   feeLegSol: number;
   openedAtMs: number;
   balanceBeforeSol: number;
+  /** Accounting fields for new ledger model */
+  cashBeforeSol: number;
+  cashAfterSol: number;
+  reservedAfterSol: number;
+  pnlSol: number;
+  feeOpenSol: number;
   legs: ExitLeg[];
   status: 'open' | 'closed';
   closeReason: string | null;
@@ -77,6 +83,14 @@ export type Position = {
   mcapUsd: number | null;
   ageHours: number | null;
   rugScore: number | null;
+  /** Unrealized PnL on current open position (SOL) */
+  unrealizedPnlSol: number;
+  /** Total PnL including fees */
+  pnlSol: number;
+  /** Fee paid on open */
+  feeOpenSol: number;
+  /** Stop price for trailing SL */
+  stopPriceUsd: number;
 };
 
 export type TickEvents = {
@@ -106,22 +120,48 @@ export function openPosition(
 ): Position {
   const qtyTokens = (cfg.posSizeSol * args.solUsdAtEntry) / args.entryPriceUsd;
   const { atMs, ...rest } = args;
+  const cashBefore = cfg.posSizeSol + cfg.feeOpenSol; // reserved amount
+  const cashAfter = cfg.posSizeSol + cfg.feeOpenSol; // after reserving
+  const reservedAfter = cfg.posSizeSol + cfg.feeOpenSol;
   return {
     ...rest,
-    openedAtMs: atMs,
+    openedAtMs: args.atMs,
     tpDone: [],
     sizeSol: cfg.posSizeSol,
     feeOpenSol: cfg.feeOpenSol,
     feeLegSol: cfg.feeLegSol,
-    qtyTokens,
-    remainingQty: qtyTokens,
+    qtyTokens: (cfg.posSizeSol * args.solUsdAtEntry) / args.entryPriceUsd,
+    remainingQty: (cfg.posSizeSol * args.solUsdAtEntry) / args.entryPriceUsd,
     peakPriceUsd: args.entryPriceUsd,
     stopPriceUsd: args.entryPriceUsd * (1 - cfg.trailPct),
-    tp1Done: false,
+    tpDone: [],
     legs: [],
     status: 'open',
     closeReason: null,
+    buyers24h: args.buyers24h,
+    liqUsd: args.liqUsd,
+    mcapUsd: args.mcapUsd,
+    ageHours: args.ageHours,
+    rugScore: args.rugScore,
+    unrealizedPnlSol: 0,
+    pnlSol: 0,
+    feeOpenSol: cfg.feeOpenSol,
+    stopPriceUsd: args.entryPriceUsd * (1 - cfg.trailPct),
+    cashBeforeSol: args.balanceBeforeSol,
+    cashAfterSol: args.balanceBeforeSol - cfg.posSizeSol - cfg.feeOpenSol,
+    reservedAfterSol: cfg.posSizeSol + cfg.feeOpenSol,
   };
+}
+
+/**
+ * Recalculate unrealized PnL for a position given current price.
+ * Returns the unrealized PnL in SOL.
+ */
+export function unrealizedPnlSol(pos: Position, currentPriceUsd: number): number {
+  if (pos.status !== 'open' || pos.qtyTokens === 0) return 0;
+  const currentValue = pos.qtyTokens * currentPriceUsd * (pos.solUsdAtEntry / pos.entryPriceUsd);
+  const costBasis = pos.sizeSol;
+  return currentValue - costBasis;
 }
 
 /** Realized PnL of selling legQty at price vs entry, in position units. Exported for manual-close flows. */
@@ -393,13 +433,13 @@ function durStr(ms: number): string {
 }
 
 /** 🟢 Open-position alert body (standard Markdown, converted at send time). */
-export function openReport(cfg: EngineConfig, pos: Position, balanceAfterSol: number, solUsd: number | null): string {
-  const valUsd = cfg.posSizeSol * (solUsd ?? pos.solUsdAtEntry);
+export function openReport(cfg: EngineConfig, pos: Position, cashAfter: number, reservedAfter: number, solUsd: number | null): string {
+  const valUsd = pos.sizeSol * (solUsd ?? pos.solUsdAtEntry);
   return [
     `🟢 **PAPER OPEN** — $${pos.symbol} (${pos.mint.slice(0, 8)}…)`,
     ``,
     `👛 Wallet: \`${pos.walletLabel}\` (\`${pos.wallet.slice(0, 8)}…\`)`,
-    `💰 Entry: ${fmtUsd(pos.entryPriceUsd)} | Size: **${cfg.posSizeSol} ${unitOf(cfg)}** (~${fmtUsd(valUsd)})`,
+    `💰 Entry: ${fmtUsd(pos.entryPriceUsd)} | Size: **${pos.sizeSol} ${unitOf(cfg)}** (~${fmtUsd(valUsd)})`,
     `👥 Tracked buyers (24h): **${pos.buyers24h}**`,
     ``,
     `🛡️ **Risk plan**`,
@@ -411,7 +451,7 @@ export function openReport(cfg: EngineConfig, pos: Position, balanceAfterSol: nu
     `• Liquidity: ${fmtUsd(pos.liqUsd)} | MCap: ${fmtUsd(pos.mcapUsd)} | Age: ${ageStr(pos.ageHours)}`,
     `• RugCheck score: ${pos.rugScore === null ? 'n/a (warn-only)' : pos.rugScore}`,
     ``,
-    `💼 Balance before: ${pos.balanceBeforeSol.toFixed(4)} ${unitOf(cfg)} → after: ${balanceAfterSol.toFixed(4)} ${unitOf(cfg)}`,
+    `💼 Cash: ${pos.cashBeforeSol.toFixed(4)} → ${pos.cashAfterSol.toFixed(4)} | Reserved: ${pos.reservedAfterSol.toFixed(4)}`,
     `🆔 \`${pos.id}\``,
   ].join('\n');
 }
@@ -433,17 +473,17 @@ export function partialReport(cfg: EngineConfig, pos: Position, leg: ExitLeg, so
 export function closeReport(
   cfg: EngineConfig,
   pos: Position,
-  balanceAfterSol: number,
+  cashAfter: number,
   solUsd: number | null,
   stats: { closed: number; wins: number; totalPnlSol: number },
 ): string {
-  const pnl = positionPnlSol(pos) - cfg.feeOpenSol;
+  const pnl = pos.pnlSol - pos.feeOpenSol;
   const icon = pnl >= 0 ? '🟢' : '🔴';
   const U = cfg.unitLabel ?? 'SOL';
   const winrate = stats.closed > 0 ? `${((stats.wins / stats.closed) * 100).toFixed(1)}% (${stats.wins}/${stats.closed})` : 'n/a';
   const usd = solUsd ? ` (~${fmtUsd(pnl * solUsd)})` : '';
   const legs = pos.legs
-    .map((l) => `• ${l.label}: ${fmtUsd(l.priceUsd)} (${fmtPct(l.priceUsd / pos.entryPriceUsd - 1)}) → ${l.pnlSol >= 0 ? '+' : ''}${l.pnlSol.toFixed(5)} ${unitOf(cfg)}`)
+    .map((l) => `• ${l.label}: ${fmtUsd(l.priceUsd)} (${fmtPct(l.priceUsd / pos.entryPriceUsd - 1)}) → ${l.pnlSol >= 0 ? '+' : ''}${l.pnlSol.toFixed(5)} ${U}`)
     .join('\n');
   return [
     `${icon} **PAPER CLOSE** — $${pos.symbol} — ${pos.closeReason}`,
@@ -454,24 +494,25 @@ export function closeReport(
     `👥 Tracked buyers (24h): **${pos.buyers24h}**`,
     ``,
     `📜 **Legs**`,
-    legs,
+    pos.legs.map((l) => `• ${l.label}: ${fmtUsd(l.priceUsd)} (${fmtPct(l.priceUsd / pos.entryPriceUsd - 1)}) → ${l.pnlSol >= 0 ? '+' : ''}${l.pnlSol.toFixed(5)} ${U}`).join('\n'),
     ``,
-    `💰 **Position PnL: ${pnl >= 0 ? '+' : ''}${pnl.toFixed(5)} ${unitOf(cfg)}**${usd}`,
-    `💼 Balance: ${pos.balanceBeforeSol.toFixed(4)} → **${balanceAfterSol.toFixed(4)} ${unitOf(cfg)}**`,
+    `💰 **Position PnL: ${pnl >= 0 ? '+' : ''}${pnl.toFixed(5)} ${U}**${usd}`,
+    `💼 Cash: ${pos.cashBeforeSol.toFixed(4)} → **${pos.cashAfterSol.toFixed(4)}** | Reserved: ${pos.reservedAfterSol.toFixed(4)}`,
     ``,
-    `📊 **Session**: winrate ${winrate} | total ${stats.totalPnlSol >= 0 ? '+' : ''}${stats.totalPnlSol.toFixed(4)} ${unitOf(cfg)} over ${stats.closed} closed`,
+    `📊 **Session**: winrate ${winrate} | total ${stats.totalPnlSol >= 0 ? '+' : ''}${stats.totalPnlSol.toFixed(4)} ${U} over ${stats.closed} closed`,
     `🆔 \`${pos.id}\``,
   ].join('\n');
 }
 
 /** 🚀 Startup card proving the service, config and Telegram path are live. */
-export function startupReport(cfg: EngineConfig, tracked: number, balanceSol: number): string {
+export function startupReport(cfg: EngineConfig, tracked: number, cashSol: number, reservedSol: number, unrealizedPnlSol: number): string {
+  const equity = cashSol + reservedSol + unrealizedPnlSol;
   return [
     `🚀 **Paper-copy reporter live**`,
     ``,
     `👀 Tracking **${tracked}** leader wallets (5-min sweep)`,
     `💰 Size **${cfg.posSizeSol} ${cfg.unitLabel ?? 'SOL'}**/pos | TP ${cfg.tpLadder.map((r) => `+${(r.pct * 100).toFixed(0)}%×${(r.share * 100).toFixed(0)}%`).join(' ')} | Trail ${(cfg.trailPct * 100).toFixed(0)}% | Hold ${cfg.maxHoldSec <= 0 ? 'off' : `≤${(cfg.maxHoldSec / 3600).toFixed(1)}h`}`,
-    `💼 Paper balance: **${balanceSol.toFixed(4)} ${cfg.unitLabel ?? 'SOL'}**`,
-    `📝 Reports: open / partial-TP / close with PnL, winrate, balances`,
+    `💼 Cash: **${cashSol.toFixed(4)}** | Reserved: **${reservedSol.toFixed(4)}** | Unrealized: **${unrealizedPnlSol.toFixed(4)}** | Equity: **${(cashSol + reservedSol + unrealizedPnlSol).toFixed(4)}**`,
+    `📝 Reports: open / partial-TP / close with PnL, winrate, equity`,
   ].join('\n');
 }

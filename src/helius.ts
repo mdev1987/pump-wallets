@@ -141,7 +141,7 @@ async function rpcRequest<T>(
 
 
 const CACHE_VERSION = 3;
-const PARSER_VERSION = 11;
+const PARSER_VERSION = 12;
 
 type LightCacheFile = {
   version: number;
@@ -648,6 +648,7 @@ async function fetchFullWindows(
     wallet_not_signer: 0,
     missing_wallet_sol_balance: 0,
     zero_sol_delta: 0,
+    dust_token_delta: 0,
     sol_direction_mismatch: 0,
     router_like_swap: 0,
     invalid_amount: 0,
@@ -707,6 +708,7 @@ async function fetchFullWindows(
       wallet_not_signer: 0,
       missing_wallet_sol_balance: 0,
       zero_sol_delta: 0,
+    dust_token_delta: 0,
       sol_direction_mismatch: 0,
     router_like_swap: 0,
       invalid_amount: 0,
@@ -757,7 +759,7 @@ async function fetchFullWindows(
       windowTransactions += page.length;
 
       for (const transaction of page) {
-        const detailed = parseTradesFromTransactionDetailed(transaction, token);
+        const detailed = parseTradesFromTransactionDetailed(transaction, token, config.minTokenBaseUnits);
         // detailed.reason is already 'accepted_transactions' when trades were
         // parsed (one count per transaction). Counting it again here used to
         // double accepted_transactions (2x accepted_trades pattern in logs).
@@ -875,6 +877,7 @@ export async function fetchTransactions(
         wallet_not_signer: 0,
         missing_wallet_sol_balance: 0,
         zero_sol_delta: 0,
+    dust_token_delta: 0,
         sol_direction_mismatch: 0,
     router_like_swap: 0,
         invalid_amount: 0,
