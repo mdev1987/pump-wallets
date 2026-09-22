@@ -78,7 +78,7 @@ type State = {
   auditOffset?: number;
 };
 
-async function loadEnvFile(path: string): Promise<Record<string, string>> {
+export async function loadEnvFile(path: string): Promise<Record<string, string>> {
   const out: Record<string, string> = {};
   try {
     for (const line of (await readFile(path, 'utf8')).split('\n')) {
