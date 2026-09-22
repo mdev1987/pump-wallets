@@ -59,12 +59,14 @@ export type Position = {
   qtyTokens: number;
   remainingQty: number;
   peakPriceUsd: number;
+  /** Stop price for trailing SL */
   stopPriceUsd: number;
   tp1Done: boolean;
   /** Per-rung fill flags aligned with cfg.tpLadder (self-migrates from tp1Done). */
   tpDone: boolean[];
   /** Notional snapshot at open so later config changes can't rewrite history. */
   sizeSol: number;
+  /** Fee paid on open */
   feeOpenSol: number;
   feeLegSol: number;
   openedAtMs: number;
@@ -73,8 +75,8 @@ export type Position = {
   cashBeforeSol: number;
   cashAfterSol: number;
   reservedAfterSol: number;
+  /** Total PnL including fees */
   pnlSol: number;
-  feeOpenSol: number;
   legs: ExitLeg[];
   status: 'open' | 'closed';
   closeReason: string | null;
@@ -85,12 +87,6 @@ export type Position = {
   rugScore: number | null;
   /** Unrealized PnL on current open position (SOL) */
   unrealizedPnlSol: number;
-  /** Total PnL including fees */
-  pnlSol: number;
-  /** Fee paid on open */
-  feeOpenSol: number;
-  /** Stop price for trailing SL */
-  stopPriceUsd: number;
 };
 
 export type TickEvents = {
@@ -134,7 +130,7 @@ export function openPosition(
     remainingQty: (cfg.posSizeSol * args.solUsdAtEntry) / args.entryPriceUsd,
     peakPriceUsd: args.entryPriceUsd,
     stopPriceUsd: args.entryPriceUsd * (1 - cfg.trailPct),
-    tpDone: [],
+    tp1Done: false,
     legs: [],
     status: 'open',
     closeReason: null,
@@ -145,8 +141,6 @@ export function openPosition(
     rugScore: args.rugScore,
     unrealizedPnlSol: 0,
     pnlSol: 0,
-    feeOpenSol: cfg.feeOpenSol,
-    stopPriceUsd: args.entryPriceUsd * (1 - cfg.trailPct),
     cashBeforeSol: args.balanceBeforeSol,
     cashAfterSol: args.balanceBeforeSol - cfg.posSizeSol - cfg.feeOpenSol,
     reservedAfterSol: cfg.posSizeSol + cfg.feeOpenSol,
@@ -159,7 +153,8 @@ export function openPosition(
  */
 export function unrealizedPnlSol(pos: Position, currentPriceUsd: number): number {
   if (pos.status !== 'open' || pos.qtyTokens === 0) return 0;
-  const currentValue = pos.qtyTokens * currentPriceUsd * (pos.solUsdAtEntry / pos.entryPriceUsd);
+  // Value in SOL at entry FX: qty * usd_price / sol_usd_price
+  const currentValue = pos.qtyTokens * currentPriceUsd / pos.solUsdAtEntry;
   const costBasis = pos.sizeSol;
   return currentValue - costBasis;
 }

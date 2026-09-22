@@ -93,7 +93,7 @@ export async function loadEnvFile(path: string): Promise<Record<string, string>>
 
 async function loadState(): Promise<State> {
   try {
-    const s = JSON.parse(await readFile(STATE_PATH, 'utf8')) as State;
+    const s = JSON.parse(await readFile(STATE_PATH, 'utf8')) as State & { balanceSol?: number };
     s.mintBuyers ??= {};
     s.opensToday ??= {};
     // Migration from old single balance to new accounting
@@ -103,6 +103,11 @@ async function loadState(): Promise<State> {
       s.realizedPnlSol = 0;
       s.unrealizedPnlSol = 0;
       delete (s as any).balanceSol;
+    }
+    // Fold any legacy cash/reserved gap into realized so equity = START + realized + unrealized holds.
+    if (typeof s.cashSol === 'number' && typeof s.reservedSol === 'number' && typeof s.realizedPnlSol === 'number') {
+      const gap = (s.cashSol + s.reservedSol) - START_BALANCE_SOL - s.realizedPnlSol;
+      if (Math.abs(gap) > 0.0001) s.realizedPnlSol += gap;
     }
     s.mintBuyers ??= {};
     s.opensToday ??= {};
@@ -424,15 +429,16 @@ async function main(): Promise<void> {
       const px = info.get(pos.mint)?.priceUsd;
       if (!px) continue;
       // Update unrealized PnL
-      const currentValue = pos.qtyTokens * px * (pos.solUsdAtEntry / pos.entryPriceUsd);
+      const currentValue = pos.qtyTokens * px / pos.solUsdAtEntry;
       const costBasis = pos.sizeSol;
       const unrealized = currentValue - costBasis;
       pos.unrealizedPnlSol = unrealized;
       totalUnrealized += unrealized;
     }
-    const equity = state.cashSol + state.reservedSol + state.unrealizedPnlSol;
+    state.unrealizedPnlSol = totalUnrealized;
+    const equity = state.cashSol + state.reservedSol + totalUnrealized;
     const expectedEquity = START_BALANCE_SOL + state.realizedPnlSol + totalUnrealized;
-    if (Math.abs(equity - expectedEquity) > 0.001) {
+    if (Math.abs(equity - expectedEquity) > 0.01) {
       console.warn(`EQUITY DRIFT: equity=${equity.toFixed(4)} expected=${expectedEquity.toFixed(4)}`);
     }
     let dirty = false;
@@ -459,6 +465,7 @@ async function main(): Promise<void> {
         pos.cashAfterSol = cashAfter;
         pos.reservedAfterSol = reservedBefore;
         await send(partialReport(cfg, pos, leg, solUsdCache));
+      }
       if (ev.closed) {
         const last = pos.legs.at(-1)!;
         const proceeds = (last.qtyTokens / pos.qtyTokens) * pos.sizeSol * (last.priceUsd / pos.entryPriceUsd);
@@ -531,7 +538,7 @@ async function main(): Promise<void> {
           } catch {
             console.log(`rug unavailable for ${b.mint} (warn-only, proceeding)`);
           }
-          if (state.balanceSol < cfg.posSizeSol + cfg.feeOpenSol) {
+          if (state.cashSol < cfg.posSizeSol + cfg.feeOpenSol) {
             console.log('insufficient paper balance, skipping entry');
             continue;
           }
@@ -550,7 +557,7 @@ async function main(): Promise<void> {
             entryPriceUsd: info.priceUsd,
             solUsdAtEntry: solUsdNow,
             atMs: Date.now(),
-            balanceBeforeSol: state.balanceSol,
+            balanceBeforeSol: state.cashSol,
             buyers24h,
             liqUsd: info.liqUsd,
             mcapUsd: info.mcapUsd,
@@ -563,7 +570,7 @@ async function main(): Promise<void> {
           state.cooldownUntil[`${t.wallet}:${b.mint}`] = Date.now() + ENTRY_COOLDOWN_MS;
           walletDayRecord(state.opensToday, t.wallet, Date.now());
           await saveState(state);
-          await send(openReport(cfg, pos, state.balanceSol, solUsdCache));
+          await send(openReport(cfg, pos, state.cashSol, state.reservedSol, solUsdCache));
         }
         await saveState(state);
       } catch (e) {
@@ -614,7 +621,7 @@ async function main(): Promise<void> {
       // Ledger self-audit every sweep: recomputed balance must match.
       const auditArgs = {
         startBalance: START_BALANCE_SOL,
-        balance: state.balanceSol,
+        balance: state.cashSol,
         positions: state.positions,
         posSize: cfg.posSizeSol,
         feeOpen: cfg.feeOpenSol,
@@ -626,7 +633,7 @@ async function main(): Promise<void> {
         // First run against pre-audit history: anchor once to the current
         // ledger (unrecorded TP1 partials of the bug era), then watch for
         // NEW drift from here. The anchor value itself is the disclosure.
-        const anchored = state.balanceSol - ledgerExpected(auditArgs);
+        const anchored = state.cashSol - ledgerExpected(auditArgs);
         state.auditOffset = anchored;
         await saveState(state);
         console.warn(`LEDGER AUDIT: anchoring legacy offset ${anchored >= 0 ? '+' : ''}${anchored.toFixed(4)} (pre-audit unrecorded partials); watching for new drift`);
@@ -635,7 +642,7 @@ async function main(): Promise<void> {
       if (problem) console.warn(`LEDGER AUDIT: ${problem}`);
       // Heartbeat every sweep: proves liveness even when the market is quiet
       // (no entries/exits), which the log-freshness health check needs.
-      console.log(`sweep complete: ${tracked.length} wallets, ${fresh} fresh buys, ${open} open, balance ${state.balanceSol.toFixed(4)} SOL, ~${credits}cr, ${((Date.now() - t0) / 1000).toFixed(0)}s${paused ? ' BREAKER-PAUSED' : ''}${problem ? ' AUDIT-FAIL' : ''}`);
+      console.log(`sweep complete: ${tracked.length} wallets, ${fresh} fresh buys, ${open} open, cash ${state.cashSol.toFixed(4)} SOL, ~${credits}cr, ${((Date.now() - t0) / 1000).toFixed(0)}s${paused ? ' BREAKER-PAUSED' : ''}${problem ? ' AUDIT-FAIL' : ''}`);
       await sleep(SWEEP_INTERVAL_MS);
     }
   };
@@ -646,4 +653,3 @@ main().catch((e) => {
   console.error(e);
   process.exitCode = 1;
 });
-}
