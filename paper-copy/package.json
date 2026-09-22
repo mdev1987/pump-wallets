@@ -6,7 +6,8 @@
   "scripts": {
     "start": "bun run paper-copy.ts",
     "check": "tsc --noEmit -p tsconfig.json",
-    "test": "bun test paper.test.ts"
+    "test": "bun test paper.test.ts",
+    "report": "bun run report.ts"
   },
   "devDependencies": {
     "@types/bun": "latest"

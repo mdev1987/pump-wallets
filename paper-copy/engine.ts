@@ -58,6 +58,12 @@ export type Position = {
   solUsdAtEntry: number;
   qtyTokens: number;
   remainingQty: number;
+  /** Original token qty at open — share of sizeSol must use this, not shrinking qtyTokens. */
+  openQty: number;
+  /** Reserved SOL still locked in this position (cost-basis share of sizeSol). */
+  reservedSol: number;
+  /** Leader's buy timestamp (ms) when we saw it — for lead-latency stats. */
+  leaderBuyTs?: number;
   peakPriceUsd: number;
   /** Stop price for trailing SL */
   stopPriceUsd: number;
@@ -112,13 +118,15 @@ export function openPosition(
     mcapUsd: number | null;
     ageHours: number | null;
     rugScore: number | null;
+    leaderBuyTs?: number;
   },
 ): Position {
   const qtyTokens = (cfg.posSizeSol * args.solUsdAtEntry) / args.entryPriceUsd;
   const { atMs, ...rest } = args;
-  const cashBefore = cfg.posSizeSol + cfg.feeOpenSol; // reserved amount
-  const cashAfter = cfg.posSizeSol + cfg.feeOpenSol; // after reserving
-  const reservedAfter = cfg.posSizeSol + cfg.feeOpenSol;
+  // Reserved holds position cost basis only. Open fee leaves cash immediately
+  // and is booked as realized cost at open (see service open path) so
+  // cash+reserved = START + realized holds through partials.
+  const reservedSol = cfg.posSizeSol;
   return {
     ...rest,
     openedAtMs: args.atMs,
@@ -126,8 +134,10 @@ export function openPosition(
     sizeSol: cfg.posSizeSol,
     feeOpenSol: cfg.feeOpenSol,
     feeLegSol: cfg.feeLegSol,
-    qtyTokens: (cfg.posSizeSol * args.solUsdAtEntry) / args.entryPriceUsd,
-    remainingQty: (cfg.posSizeSol * args.solUsdAtEntry) / args.entryPriceUsd,
+    qtyTokens,
+    remainingQty: qtyTokens,
+    openQty: qtyTokens,
+    reservedSol,
     peakPriceUsd: args.entryPriceUsd,
     stopPriceUsd: args.entryPriceUsd * (1 - cfg.trailPct),
     tp1Done: false,
@@ -143,7 +153,8 @@ export function openPosition(
     pnlSol: 0,
     cashBeforeSol: args.balanceBeforeSol,
     cashAfterSol: args.balanceBeforeSol - cfg.posSizeSol - cfg.feeOpenSol,
-    reservedAfterSol: cfg.posSizeSol + cfg.feeOpenSol,
+    reservedAfterSol: reservedSol,
+    leaderBuyTs: args.leaderBuyTs,
   };
 }
 
@@ -152,18 +163,39 @@ export function openPosition(
  * Returns the unrealized PnL in SOL.
  */
 export function unrealizedPnlSol(pos: Position, currentPriceUsd: number): number {
-  if (pos.status !== 'open' || pos.qtyTokens === 0) return 0;
-  // Value in SOL at entry FX: qty * usd_price / sol_usd_price
-  const currentValue = pos.qtyTokens * currentPriceUsd / pos.solUsdAtEntry;
-  const costBasis = pos.sizeSol;
+  const qty = pos.remainingQty ?? pos.qtyTokens;
+  if (pos.status !== 'open' || !(qty > 0)) return 0;
+  const openQty = pos.openQty || pos.qtyTokens || 1;
+  const sizeSol = pos.sizeSol ?? 0;
+  const costBasis = (qty / openQty) * sizeSol;
+  const currentValue = (qty * currentPriceUsd) / pos.solUsdAtEntry;
   return currentValue - costBasis;
 }
 
 /** Realized PnL of selling legQty at price vs entry, in position units. Exported for manual-close flows. */
 export function legPnlSol(cfg: EngineConfig, pos: Position, legQty: number, priceUsd: number): number {
-  const entryCostShare = (legQty / pos.qtyTokens) * cfg.posSizeSol;
-  const proceedsShare = (legQty / pos.qtyTokens) * cfg.posSizeSol * (priceUsd / pos.entryPriceUsd);
-  return proceedsShare - entryCostShare - cfg.feeLegSol;
+  const openQty = pos.openQty || pos.qtyTokens || 1;
+  const sizeSol = pos.sizeSol ?? cfg.posSizeSol;
+  const feeLeg = pos.feeLegSol ?? cfg.feeLegSol;
+  const entryCostShare = (legQty / openQty) * sizeSol;
+  const proceedsShare = entryCostShare * (priceUsd / pos.entryPriceUsd);
+  return proceedsShare - entryCostShare - feeLeg;
+}
+
+/** SOL proceeds credited to cash for selling legQty (before leg fee). */
+export function legProceedsSol(pos: Position, legQty: number, priceUsd: number): number {
+  const openQty = pos.openQty || pos.qtyTokens || 1;
+  const sizeSol = pos.sizeSol ?? 0;
+  return (legQty / openQty) * sizeSol * (priceUsd / pos.entryPriceUsd);
+}
+
+/** Reserved SOL released by selling legQty (cost-basis share of size only). */
+export function legReservedReleaseSol(pos: Position, legQty: number): number {
+  const openQty = pos.openQty || pos.qtyTokens || 1;
+  const sizeSol = pos.sizeSol ?? 0;
+  const stillLocked = pos.reservedSol ?? sizeSol;
+  const release = (legQty / openQty) * sizeSol;
+  return Math.min(Math.max(release, 0), Math.max(stillLocked, 0));
 }
 
 /**
@@ -185,13 +217,13 @@ export function tickPosition(cfg: EngineConfig, pos: Position, priceUsd: number,
 
   // Self-migrate pre-ladder positions (tp1Done era): first rung = old TP1.
   if (pos.tpDone === undefined) pos.tpDone = [!!pos.tp1Done];
-  const anyFilled = pos.tpDone.some(Boolean);
 
   for (let i = 0; i < cfg.tpLadder.length; i += 1) {
     const rung = cfg.tpLadder[i]!;
     if (pos.tpDone[i] || ret < rung.pct || pos.remainingQty <= 0) continue;
     pos.tpDone[i] = true;
-    const qty = Math.min(pos.qtyTokens * rung.share, pos.remainingQty);
+    const openQty = pos.openQty || pos.qtyTokens || 1;
+    const qty = Math.min(openQty * rung.share, pos.remainingQty);
     pos.remainingQty -= qty;
     // Partial legs join pos.legs immediately: otherwise realized partial PnL
     // is credited to the ledger but invisible to positionPnlSol/close records.
@@ -215,7 +247,10 @@ export function tickPosition(cfg: EngineConfig, pos: Position, priceUsd: number,
     pos.remainingQty = 0;
     pos.status = 'closed';
     pos.closeReason = reason;
-    pos.legs.push({ kind, label, priceUsd, qtyTokens: qty, pnlSol: legPnlSol(cfg, pos, qty, priceUsd), atMs: nowMs });
+    // Zero-qty closes (dust already swept) record no leg: avoids a phantom -feeLeg.
+    if (qty > 0) {
+      pos.legs.push({ kind, label, priceUsd, qtyTokens: qty, pnlSol: legPnlSol(cfg, pos, qty, priceUsd), atMs: nowMs });
+    }
     closed = true;
     closeReason = reason;
   };
@@ -223,7 +258,7 @@ export function tickPosition(cfg: EngineConfig, pos: Position, priceUsd: number,
   // Ladder exhausted (rung shares sum to ~all): convert the last fill of
   // this tick into the closing leg so its size and PnL are not lost to the
   // emptied remainder. Otherwise the remainder rides as a runner.
-  const dust = pos.qtyTokens * 0.001;
+  const dust = (pos.openQty || pos.qtyTokens || 0) * 0.001;
   if (pos.remainingQty <= dust && pos.tpDone.some(Boolean)) {
     const lastFill = partials.at(-1);
     const lastIdx = pos.tpDone.lastIndexOf(true);
@@ -233,7 +268,14 @@ export function tickPosition(cfg: EngineConfig, pos: Position, priceUsd: number,
       // lastFill is already recorded in pos.legs (same object): relabel it
       // and withhold it from partials so the service credits it once, here.
       partials.pop();
+      const dustRemainder = pos.remainingQty;
       lastFill.label = label;
+      if (dustRemainder > 0) {
+        // Fold sub-0.1% dust into the final fill so every token is credited
+        // exactly once (single leg fee for the combined fill).
+        lastFill.qtyTokens += dustRemainder;
+        lastFill.pnlSol = legPnlSol(cfg, pos, lastFill.qtyTokens, priceUsd);
+      }
       pos.remainingQty = lastFill.qtyTokens;
       pos.status = 'closed';
       pos.closeReason = label;
@@ -343,11 +385,59 @@ export type LedgerPosition = {
   sizeSol?: number;
   feeOpenSol?: number;
   feeLegSol?: number;
+  openQty?: number;
   legs: Array<{ qtyTokens: number; priceUsd: number; pnlSol: number }>;
 };
 
-/** Recompute the expected balance from persisted legs (NaN on bad data). */
-export function ledgerExpected(
+/** Normalize a chain timestamp to ms (Helius Enhanced uses seconds). */
+export function asMs(ts: number): number {
+  return ts > 1e12 ? ts : ts * 1000;
+}
+
+/** Max-mcap gate: unknown mcap passes (DexScreener gaps must not block flow). */
+export function mcapBlocked(mcapUsd: number | null, max: number): boolean {
+  return mcapUsd !== null && Number.isFinite(mcapUsd) && mcapUsd > max;
+}
+
+/** Adaptive toxic-wallet filter: n>=5 closed and negative expectancy. */
+export const WALLET_TOXIC_MIN_TRADES = 5;
+export const WALLET_TOXIC_MAX_EXPECTANCY = -0.001; // SOL per trade
+
+export function walletTradeStats(
+  closed: Array<{ wallet?: string; pnlSol: number }>,
+  wallet: string,
+): { n: number; wins: number; totalPnlSol: number; expectancySol: number } {
+  const ts = closed.filter((c) => c.wallet === wallet);
+  const total = ts.reduce((sum, c) => sum + (c.pnlSol || 0), 0);
+  return {
+    n: ts.length,
+    wins: ts.filter((c) => c.pnlSol > 0).length,
+    totalPnlSol: total,
+    expectancySol: ts.length ? total / ts.length : 0,
+  };
+}
+
+export function walletToxic(
+  closed: Array<{ wallet?: string; pnlSol: number }>,
+  wallet: string,
+): boolean {
+  const st = walletTradeStats(closed, wallet);
+  return st.n >= WALLET_TOXIC_MIN_TRADES && st.expectancySol < WALLET_TOXIC_MAX_EXPECTANCY;
+}
+
+/**
+ * Independently recompute cash from persisted legs (no shared helpers, so a
+ * formula bug in the credit path cannot hide behind the same formula here).
+ * expected = start - Σ(size+feeOpen) + Σ(share*size*price/entry - feeLeg).
+ * NaN when any leg/position value is non-finite.
+ */
+/**
+ * Expected cash under the cash/reserved/realized equity model:
+ *   cash + reserved = startBalance + realized
+ * so expected cash = start + realized - reserved.
+ * positions are accepted for signature compatibility but not required.
+ */
+export function expectedCashFromLegs(
   args: {
     startBalance: number;
     positions: LedgerPosition[];
@@ -358,23 +448,43 @@ export function ledgerExpected(
 ): number {
   let expected = args.startBalance;
   for (const p of args.positions) {
-    // Prefer the per-position snapshot so later config changes can't rewrite
-    // history; fall back to current cfg for pre-snapshot positions.
     const size = p.sizeSol ?? args.posSize;
     const feeO = p.feeOpenSol ?? args.feeOpen;
     const feeL = p.feeLegSol ?? args.feeLeg;
+    const openQty = p.openQty ?? p.qtyTokens;
+    if (![size, feeO, feeL, openQty, p.entryPriceUsd].every(Number.isFinite)) return NaN;
+    if (!(p.entryPriceUsd > 0) || !(openQty > 0)) return NaN;
     expected -= size + feeO;
     for (const l of p.legs) {
-      if (!Number.isFinite(l.pnlSol) || !Number.isFinite(l.qtyTokens) || !Number.isFinite(l.priceUsd)) {
-        return NaN;
-      }
-      const share = p.qtyTokens > 0 ? l.qtyTokens / p.qtyTokens : 0;
-      expected += share * size * (l.priceUsd / p.entryPriceUsd) - feeL;
+      if (![l.qtyTokens, l.priceUsd].every(Number.isFinite)) return NaN;
+      expected += (l.qtyTokens / openQty) * size * (l.priceUsd / p.entryPriceUsd) - feeL;
     }
   }
   return expected;
 }
 
+export function ledgerExpected(
+  args: {
+    startBalance: number;
+    positions: LedgerPosition[];
+    posSize: number;
+    feeOpen: number;
+    feeLeg: number;
+    realized?: number;
+    reserved?: number;
+  },
+): number {
+  const realized = args.realized ?? 0;
+  const reserved = args.reserved ?? 0;
+  if (!Number.isFinite(realized) || !Number.isFinite(reserved)) return NaN;
+  return args.startBalance + realized - reserved;
+}
+
+/**
+ * Equity audit for the cash/reserved model:
+ *   | (cash + reserved) - (start + realized) | <= tol
+ * legacyOffset anchors pre-migration books once.
+ */
 export function auditLedger(args: {
   startBalance: number;
   balance: number;
@@ -382,22 +492,83 @@ export function auditLedger(args: {
   posSize: number;
   feeOpen: number;
   feeLeg: number;
-  /**
-   * One-time anchor for pre-audit history whose credits were never recorded
-   * (e.g. partial legs credited before persistence existed). New drift past
-   * the anchor still trips the audit.
-   */
+  realized?: number;
+  reserved?: number;
   legacyOffset?: number;
+  /** Actual cash for the independent legs-based check; omit to skip it. */
+  cash?: number;
+  /** One-time anchor for pre-audit cash history (same pattern as legacyOffset). */
+  cashOffset?: number;
+  cashTol?: number;
 }): string | null {
   if (!Number.isFinite(args.balance) || args.balance < 0 || args.balance > args.startBalance * 10) {
     return `balance out of range: ${args.balance}`;
   }
-  const expected = ledgerExpected(args) + (args.legacyOffset ?? 0);
-  if (!Number.isFinite(expected)) return 'non-finite leg value in ledger';
-  if (Math.abs(expected - args.balance) > 0.001) {
-    return `balance drift: ledger ${args.balance.toFixed(4)} vs recomputed ${expected.toFixed(4)}`;
+  const reserved = args.reserved ?? 0;
+  const realized = args.realized ?? 0;
+  if (!Number.isFinite(reserved) || reserved < -1e-9) {
+    return `reserved out of range: ${reserved}`;
+  }
+  if (Number.isFinite(reserved) && reserved > 10 * args.posSize + 1e-9) {
+    return `reserved implausible: ${reserved} (cap ${10 * args.posSize})`;
+  }
+  if (!Number.isFinite(realized)) return 'non-finite realized pnl';
+  const equityLedger = args.balance + Math.max(reserved, 0);
+  const equityExpected = args.startBalance + realized + (args.legacyOffset ?? 0);
+  if (Math.abs(equityLedger - equityExpected) > 0.001) {
+    return `equity drift: cash+reserved ${equityLedger.toFixed(4)} vs start+realized ${equityExpected.toFixed(4)}`;
+  }
+  if (args.cash !== undefined) {
+    const recomputed = expectedCashFromLegs(args);
+    if (Number.isFinite(recomputed)) {
+      const tol = args.cashTol ?? 0.01;
+      if (Math.abs(args.cash - (recomputed + (args.cashOffset ?? 0))) > tol) {
+        return `cash drift: ledger ${args.cash.toFixed(4)} vs legs-recomputed ${(recomputed + (args.cashOffset ?? 0)).toFixed(4)}`;
+      }
+    }
   }
   return null;
+}
+
+/** Balances mutated by settlement; the position carries the rest. */
+export type LedgerBalances = { cashSol: number; reservedSol: number; realizedPnlSol: number };
+
+/**
+ * Settle one exit leg against the ledger. Pure except for mutating its
+ * arguments — the single place partials and closes touch money, so the
+ * invariant cash+reserved == START+realized holds by construction.
+ * Engine already reduced remainingQty; qtyTokens is synced to it.
+ */
+export function settlePartial(
+  cfg: EngineConfig,
+  ledger: LedgerBalances,
+  pos: Position,
+  leg: ExitLeg,
+): void {
+  const feeLeg = pos.feeLegSol ?? cfg.feeLegSol;
+  ledger.cashSol += legProceedsSol(pos, leg.qtyTokens, leg.priceUsd) - feeLeg;
+  const release = legReservedReleaseSol(pos, leg.qtyTokens);
+  ledger.reservedSol -= release;
+  pos.reservedSol = Math.max(0, (pos.reservedSol ?? 0) - release);
+  pos.qtyTokens = pos.remainingQty;
+  ledger.realizedPnlSol += leg.pnlSol;
+}
+
+/** Settle the final leg of a close, then sweep float dust (no cash credit). */
+export function settleCloseLeg(
+  cfg: EngineConfig,
+  ledger: LedgerBalances,
+  pos: Position,
+  leg: ExitLeg,
+): void {
+  settlePartial(cfg, ledger, pos, leg);
+  if ((pos.reservedSol ?? 0) > 0) {
+    ledger.reservedSol -= pos.reservedSol!;
+    pos.reservedSol = 0;
+  }
+  pos.qtyTokens = 0;
+  pos.remainingQty = 0;
+  if (ledger.reservedSol < 0) ledger.reservedSol = 0;
 }
 
 export function fmtUsd(v: number | null): string {
@@ -457,7 +628,7 @@ export function partialReport(cfg: EngineConfig, pos: Position, leg: ExitLeg, so
   return [
     `🔔 **PARTIAL TP** — $${pos.symbol}`,
     ``,
-    `• Sold ${(leg.qtyTokens / pos.qtyTokens * 100).toFixed(0)}% at ${fmtUsd(leg.priceUsd)} (${fmtPct(leg.priceUsd / pos.entryPriceUsd - 1)})`,
+    `• Sold ${(leg.qtyTokens / (pos.openQty || pos.qtyTokens) * 100).toFixed(0)}% at ${fmtUsd(leg.priceUsd)} (${fmtPct(leg.priceUsd / pos.entryPriceUsd - 1)})`,
     `• Realized: **${leg.pnlSol >= 0 ? '+' : ''}${leg.pnlSol.toFixed(5)} ${unitOf(cfg)}**${usd}`,
     `• Runner left: ${(pos.remainingQty).toFixed(2)} tokens | stop now ${fmtUsd(pos.stopPriceUsd)}`,
     `🆔 \`${pos.id}\``,
@@ -477,9 +648,6 @@ export function closeReport(
   const U = cfg.unitLabel ?? 'SOL';
   const winrate = stats.closed > 0 ? `${((stats.wins / stats.closed) * 100).toFixed(1)}% (${stats.wins}/${stats.closed})` : 'n/a';
   const usd = solUsd ? ` (~${fmtUsd(pnl * solUsd)})` : '';
-  const legs = pos.legs
-    .map((l) => `• ${l.label}: ${fmtUsd(l.priceUsd)} (${fmtPct(l.priceUsd / pos.entryPriceUsd - 1)}) → ${l.pnlSol >= 0 ? '+' : ''}${l.pnlSol.toFixed(5)} ${U}`)
-    .join('\n');
   return [
     `${icon} **PAPER CLOSE** — $${pos.symbol} — ${pos.closeReason}`,
     ``,
