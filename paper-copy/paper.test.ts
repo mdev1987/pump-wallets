@@ -450,3 +450,59 @@ describe("review fixes: settle, filters, recompute", () => {
     expect(r.wallets[0]!.avgLeadMs).toBeNull();
   });
 });
+
+describe("improvements batch: mcap, windows, lead buckets", () => {
+  test("assessMcap: unknown ok, over-cap blocks, absurd is bad data", async () => {
+    const { assessMcap, mcapBlocked } = await import("./engine");
+    expect(assessMcap(null, 3_000_000)).toBe("ok");
+    expect(assessMcap(1_000_000, 3_000_000)).toBe("ok");
+    expect(assessMcap(42_000_000, 3_000_000)).toBe("over-cap");
+    expect(assessMcap(74_726_975_266, 3_000_000)).toBe("bad-data");
+    expect(mcapBlocked(74_726_975_266, 3_000_000)).toBe(false);
+    expect(mcapBlocked(42_000_000, 3_000_000)).toBe(true);
+  });
+
+  test("windowed stats let wallets redeem themselves", async () => {
+    const { walletTradeStats, walletToxic } = await import("./engine");
+    const old = Array.from({ length: 10 }, () => ({ wallet: "W", pnlSol: -0.01 }));
+    const recent = Array.from({ length: 6 }, () => ({ wallet: "W", pnlSol: 0.01 }));
+    const closed = [...old, ...recent];
+    // All-history view: still toxic
+    expect(walletToxic(closed, "W")).toBe(true);
+    expect(walletTradeStats(closed, "W").n).toBe(16);
+    // Last-6 window: redeemed
+    const st = walletTradeStats(closed, "W", { lastN: 6 });
+    expect(st.n).toBe(6);
+    expect(st.expectancySol).toBeCloseTo(0.01, 9);
+  });
+
+  test("leadBuckets split PnL by entry delay", async () => {
+    const { leadBuckets } = await import("./engine");
+    const trades = [
+      { leadMs: 60_000, pnlSol: 0.02, win: true },
+      { leadMs: 100_000, pnlSol: -0.01, win: false },
+      { leadMs: 200_000, pnlSol: 0.01, win: true },
+      { leadMs: 300_000, pnlSol: -0.02, win: false },
+      { leadMs: null, pnlSol: 99, win: true }, // ignored
+    ];
+    const [fast, mid, slow] = leadBuckets(trades);
+    expect(fast!.n).toBe(2);
+    expect(fast!.totalPnlSol).toBeCloseTo(0.01, 9);
+    expect(mid!.n).toBe(1);
+    expect(slow!.n).toBe(1);
+    expect(slow!.totalPnlSol).toBeCloseTo(-0.02, 9);
+  });
+
+  test("report separates book PnL from ledger residue", async () => {
+    const { buildReport, formatReport } = await import("./report");
+    const state = {
+      cashSol: 10.35, reservedSol: 0, realizedPnlSol: 0.35, unrealizedPnlSol: 0,
+      positions: [],
+      closed: [{ id: "a", mint: "M", symbol: "A", wallet: "W", pnlSol: -0.01, win: false, atMs: 1, holdMs: 1, closeReason: "trail" }],
+    };
+    const r = buildReport(state);
+    expect(r.totalPnlSol).toBeCloseTo(-0.01, 9);
+    expect(r.ledgerGapSol).toBeCloseTo(0.36, 9);
+    expect(formatReport(r)).toContain("not trading edge");
+  });
+});

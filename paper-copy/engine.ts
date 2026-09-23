@@ -396,7 +396,22 @@ export function asMs(ts: number): number {
 
 /** Max-mcap gate: unknown mcap passes (DexScreener gaps must not block flow). */
 export function mcapBlocked(mcapUsd: number | null, max: number): boolean {
-  return mcapUsd !== null && Number.isFinite(mcapUsd) && mcapUsd > max;
+  return assessMcap(mcapUsd, max) === 'over-cap';
+}
+
+/**
+ * Mcap gate verdict. Prints above `implausibleUsd` (default $1B) are treated
+ * as bad vendor data, not real mega-caps: a pump-fun meme at $74B is a
+ * misread field, and vetoing on it silently over-filters the funnel.
+ */
+export function assessMcap(
+  mcapUsd: number | null,
+  max: number,
+  implausibleUsd = 1_000_000_000,
+): 'ok' | 'over-cap' | 'bad-data' {
+  if (mcapUsd === null || !Number.isFinite(mcapUsd)) return 'ok';
+  if (mcapUsd > implausibleUsd) return 'bad-data';
+  return mcapUsd > max ? 'over-cap' : 'ok';
 }
 
 /** Adaptive toxic-wallet filter: n>=5 closed and negative expectancy. */
@@ -406,22 +421,27 @@ export const WALLET_TOXIC_MAX_EXPECTANCY = -0.001; // SOL per trade
 export function walletTradeStats(
   closed: Array<{ wallet?: string; pnlSol: number }>,
   wallet: string,
+  opts?: { lastN?: number },
 ): { n: number; wins: number; totalPnlSol: number; expectancySol: number } {
+  // Windowed to the most recent lastN closes: old sins roll off, so a wallet
+  // can redeem itself (and a formerly-good wallet that decayed gets caught).
   const ts = closed.filter((c) => c.wallet === wallet);
-  const total = ts.reduce((sum, c) => sum + (c.pnlSol || 0), 0);
+  const windowed = opts?.lastN != null ? ts.slice(-opts.lastN) : ts;
+  const total = windowed.reduce((sum, c) => sum + (c.pnlSol || 0), 0);
   return {
-    n: ts.length,
-    wins: ts.filter((c) => c.pnlSol > 0).length,
+    n: windowed.length,
+    wins: windowed.filter((c) => c.pnlSol > 0).length,
     totalPnlSol: total,
-    expectancySol: ts.length ? total / ts.length : 0,
+    expectancySol: windowed.length ? total / windowed.length : 0,
   };
 }
 
 export function walletToxic(
   closed: Array<{ wallet?: string; pnlSol: number }>,
   wallet: string,
+  lastN = 20,
 ): boolean {
-  const st = walletTradeStats(closed, wallet);
+  const st = walletTradeStats(closed, wallet, { lastN });
   return st.n >= WALLET_TOXIC_MIN_TRADES && st.expectancySol < WALLET_TOXIC_MAX_EXPECTANCY;
 }
 
@@ -528,6 +548,29 @@ export function auditLedger(args: {
     }
   }
   return null;
+}
+
+/** Lead-latency buckets: does entering later after the leader buy lose money? */
+export type LeadBucket = { label: string; n: number; wins: number; totalPnlSol: number; winRate: number };
+
+export function leadBuckets(
+  trades: Array<{ leadMs: number | null; pnlSol: number; win: boolean }>,
+): LeadBucket[] {
+  const defs: Array<{ label: string; test: (ms: number) => boolean }> = [
+    { label: '<2m', test: (ms) => ms < 120_000 },
+    { label: '2-4m', test: (ms) => ms < 240_000 },
+    { label: '>=4m', test: () => true },
+  ];
+  const out: LeadBucket[] = defs.map((d) => ({ label: d.label, n: 0, wins: 0, totalPnlSol: 0, winRate: 0 }));
+  for (const t of trades) {
+    if (t.leadMs == null || !Number.isFinite(t.leadMs)) continue;
+    const b = out.find((_, i) => defs[i]!.test(t.leadMs!))!;
+    b.n += 1;
+    if (t.win) b.wins += 1;
+    b.totalPnlSol += t.pnlSol;
+  }
+  for (const b of out) b.winRate = b.n ? b.wins / b.n : 0;
+  return out;
 }
 
 /** Balances mutated by settlement; the position carries the rest. */

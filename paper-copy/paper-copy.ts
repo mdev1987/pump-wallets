@@ -14,6 +14,7 @@ import {
   DEFAULT_CONFIG,
   assessRug,
   asMs,
+  assessMcap,
   auditLedger,
   expectedCashFromLegs,
   ledgerExpected,
@@ -62,6 +63,9 @@ const MAX_OPENS_PER_WALLET_PER_DAY = 3;
 // With minutes of copy latency behind the leader, buying into an already
 // vertical 5-minute print means buying their top.
 const MOMENTUM_MAX_M5_PCT = 20;
+// Max age of the leader buy we will copy (conservative): entries later than
+// this are chasing, not copying. Tuned from the report's lead buckets.
+const MAX_LEAD_MS = 10 * 60_000;
 // Circuit breaker: this many Helius wallet errors in one sweep pauses NEW
 // entries for 30 min (position management is never paused).
 const BREAKER_SWEEP_ERRORS = 8;
@@ -572,11 +576,24 @@ async function main(): Promise<void> {
 
   // Declared up here: sweepWithErrors reads it, and `let` is TDZ-sensitive.
   let breakerUntilMs = 0;
-  const sweepWithErrors = async (): Promise<{ fresh: number; errors: number; credits: number }> => {
+  type Funnel = {
+    mintDup: number; walletOpen: number; maxOpen: number; cooldown: number; budget: number;
+    blocked: number; toxic: number; staleLead: number; noPrice: number; momentum: number;
+    liq: number; mcap: number; mcapBadData: number; rug: number; noCash: number; noSolUsd: number;
+    entries: number;
+  };
+  const emptyFunnel = (): Funnel => ({
+    mintDup: 0, walletOpen: 0, maxOpen: 0, cooldown: 0, budget: 0,
+    blocked: 0, toxic: 0, staleLead: 0, noPrice: 0, momentum: 0,
+    liq: 0, mcap: 0, mcapBadData: 0, rug: 0, noCash: 0, noSolUsd: 0,
+    entries: 0,
+  });
+  const sweepWithErrors = async (): Promise<{ fresh: number; errors: number; credits: number; funnel: Funnel }> => {
     let fresh = 0;
     let errors = 0;
     let credits = 0;
     let dirty = false;
+    const funnel = emptyFunnel();
     const entriesPaused = Date.now() < breakerUntilMs;
     for (const t of tracked) {
       try {
@@ -591,39 +608,51 @@ async function main(): Promise<void> {
           continue;
         }
         for (const b of buys) {
-          if (state.positions.some((p) => p.status === 'open' && p.mint === b.mint)) continue;
+          if (state.positions.some((p) => p.status === 'open' && p.mint === b.mint)) { funnel.mintDup += 1; continue; }
           // One open position per wallet: kEFiAX-class hyperactivity would
           // otherwise fill every slot with correlated bets on one actor.
           if (state.positions.some((p) => p.status === 'open' && p.wallet === t.wallet)) {
-            console.log(`skip ${b.mint.slice(0, 8)}: wallet already has an open position`);
+            funnel.walletOpen += 1;
             continue;
           }
-          if (state.positions.filter((p) => p.status === 'open').length >= MAX_OPEN_POSITIONS) break;
-          if ((state.cooldownUntil[`${t.wallet}:${b.mint}`] ?? 0) > Date.now()) continue;
+          if (state.positions.filter((p) => p.status === 'open').length >= MAX_OPEN_POSITIONS) { funnel.maxOpen += 1; break; }
+          if ((state.cooldownUntil[`${t.wallet}:${b.mint}`] ?? 0) > Date.now()) { funnel.cooldown += 1; continue; }
           if (!walletDayAllowed(state.opensToday, t.wallet, Date.now(), MAX_OPENS_PER_WALLET_PER_DAY)) {
-            console.log(`skip ${b.mint.slice(0, 8)}: wallet daily budget exhausted`);
+            funnel.budget += 1;
             continue;
           }
           if (BLOCKED_WALLETS.includes(t.wallet)) {
-            console.log(`skip ${b.mint.slice(0, 8)}: wallet blocklisted (proven toxic)`);
+            funnel.blocked += 1;
             continue;
           }
           if (walletToxic(state.closed, t.wallet)) {
-            const st = walletTradeStats(state.closed, t.wallet);
-            console.log(`skip ${b.mint.slice(0, 8)}: wallet toxic (${st.n} closed, exp ${st.expectancySol.toFixed(4)})`);
+            const st = walletTradeStats(state.closed, t.wallet, { lastN: 20 });
+            funnel.toxic += 1;
+            console.log(`skip ${b.mint.slice(0, 8)}: wallet toxic (${st.n} recent, exp ${st.expectancySol.toFixed(4)})`);
+            continue;
+          }
+          // Stale leader buy: copying minutes-old flow is chasing, not copying.
+          if (Date.now() - b.ts > MAX_LEAD_MS) {
+            funnel.staleLead += 1;
+            console.log(`skip ${b.mint.slice(0, 8)}: leader buy ${((Date.now() - b.ts) / 60000).toFixed(1)}m old (>${MAX_LEAD_MS / 60000}m)`);
             continue;
           }
           const info = (await dexBatch([b.mint])).get(b.mint);
-          if (!info?.priceUsd) continue;
+          if (!info?.priceUsd) { funnel.noPrice += 1; continue; }
           if (momentumBlocked(info.chgM5, MOMENTUM_MAX_M5_PCT)) {
-            console.log(`skip ${b.mint.slice(0, 8)}: vertical m5 (+${info.chgM5}%), not chasing`);
+            funnel.momentum += 1;
             continue;
           }
-          if ((info.liqUsd ?? 0) < MIN_LIQ_USD) continue;
-          // Unknown mcap passes: DexScreener gaps must not block flow.
-          if (mcapBlocked(info.mcapUsd, MAX_MCAP_USD)) {
-            console.log(`skip ${b.mint.slice(0, 8)}: mcap ${info.mcapUsd} over cap`);
+          if ((info.liqUsd ?? 0) < MIN_LIQ_USD) { funnel.liq += 1; continue; }
+          // Unknown mcap passes; implausible prints ($1B+) are bad vendor data.
+          const mcapVerdict = assessMcap(info.mcapUsd, MAX_MCAP_USD);
+          if (mcapVerdict === 'over-cap') {
+            funnel.mcap += 1;
             continue;
+          }
+          if (mcapVerdict === 'bad-data') {
+            funnel.mcapBadData += 1;
+            console.log(`mcap ${info.mcapUsd} for ${b.mint.slice(0, 8)} implausible, ignoring (liq gate still applies)`);
           }
           if ((info.ageHours ?? 0) > MAX_AGE_HOURS) continue;
           let rug: number | null = null;
@@ -631,6 +660,7 @@ async function main(): Promise<void> {
             const assessment = assessRug(await rugSummary(b.mint));
             rug = assessment.score;
             if (assessment.veto) {
+              funnel.rug += 1;
               console.log(`rug veto ${b.mint} ${assessment.reason}`);
               continue;
             }
@@ -641,11 +671,13 @@ async function main(): Promise<void> {
             console.log(`rug unavailable for ${b.mint} (warn-only, proceeding)`);
           }
           if (state.cashSol < cfg.posSizeSol + cfg.feeOpenSol) {
+            funnel.noCash += 1;
             console.log('insufficient paper balance, skipping entry');
             continue;
           }
           const solUsdNow = solUsdCache;
           if (solUsdNow === null) {
+            funnel.noSolUsd += 1;
             console.log('no SOL/USD yet, skipping entry');
             continue;
           }
@@ -674,6 +706,7 @@ async function main(): Promise<void> {
           state.cooldownUntil[`${t.wallet}:${b.mint}`] = Date.now() + ENTRY_COOLDOWN_MS;
           walletDayRecord(state.opensToday, t.wallet, Date.now());
           dirty = true;
+          funnel.entries += 1;
           await saveState(state);
           await send(openReport(cfg, pos, state.cashSol, state.reservedSol, solUsdCache));
         }
@@ -685,7 +718,7 @@ async function main(): Promise<void> {
       await sleep(WALLET_SPACING_MS);
     }
     if (dirty) await saveState(state);
-    return { fresh, errors, credits };
+    return { fresh, errors, credits, funnel };
   };
 
   // Price ticks every 30s idle, 15s while positions are open (TP levels live
@@ -699,6 +732,8 @@ async function main(): Promise<void> {
   };
   // consecutive sweeps hitting the breaker threshold pause NEW entries
   // (position management is never paused).
+  let breakerAlerted = false;
+  let lowKeysAlerted = false;
   const sweepLoop = async (): Promise<void> => {
     for (;;) {
       solUsdCache = (await solUsd().catch(() => solUsdCache)) ?? solUsdCache;
@@ -706,20 +741,39 @@ async function main(): Promise<void> {
       let fresh = 0;
       let heliusErrors = 0;
       let credits = 0;
+      let funnel = emptyFunnel();
       try {
         const r = await sweepWithErrors();
         fresh = r.fresh;
         heliusErrors = r.errors;
         credits = r.credits;
+        funnel = r.funnel;
       } catch (e) {
         console.warn('sweep', String(e).slice(0, 120));
         heliusErrors = TRACK_TOP_N;
       }
+      const wasPaused = Date.now() < breakerUntilMs;
       if (heliusErrors >= BREAKER_SWEEP_ERRORS) {
         breakerUntilMs = Date.now() + BREAKER_PAUSE_MS;
         console.warn(`CIRCUIT BREAKER: ${heliusErrors} Helius errors, new entries paused 30m (management continues)`);
+        if (!breakerAlerted) {
+          breakerAlerted = true;
+          await send(`⚠️ **CIRCUIT BREAKER** — ${heliusErrors} Helius errors, new entries paused 30m (management continues)`).catch((e) => console.warn('breaker alert failed', String(e).slice(0, 80)));
+        }
       } else if (heliusErrors === 0) {
         breakerUntilMs = 0;
+        if (wasPaused) {
+          breakerAlerted = false;
+          await send('✅ **Circuit breaker cleared** — entries resumed').catch((e) => console.warn('breaker clear alert failed', String(e).slice(0, 80)));
+        }
+      }
+      if (pool.size() < 2 && !lowKeysAlerted) {
+        lowKeysAlerted = true;
+        const msg = `⚠️ **Helius key pool low** — ${pool.size()} keys left`;
+        console.warn(msg);
+        await send(msg).catch((e) => console.warn('key alert failed', String(e).slice(0, 80)));
+      } else if (pool.size() >= 2) {
+        lowKeysAlerted = false;
       }
       const paused = Date.now() < breakerUntilMs;
       const open = state.positions.filter((p) => p.status === 'open').length;
@@ -761,7 +815,9 @@ async function main(): Promise<void> {
       if (problem) console.warn(`LEDGER AUDIT: ${problem}`);
       // Heartbeat every sweep: proves liveness even when the market is quiet
       // (no entries/exits), which the log-freshness health check needs.
+      const f = funnel;
       console.log(`sweep complete: ${tracked.length} wallets, ${fresh} fresh buys, ${open} open, cash ${state.cashSol.toFixed(4)} SOL, ~${credits}cr, ${((Date.now() - t0) / 1000).toFixed(0)}s${paused ? ' BREAKER-PAUSED' : ''}${problem ? ' AUDIT-FAIL' : ''}`);
+      console.log(`funnel: entries=${f.entries} budget=${f.budget} mcap=${f.mcap} mcapBad=${f.mcapBadData} momentum=${f.momentum} liq=${f.liq} toxic=${f.blocked + f.toxic} staleLead=${f.staleLead} rug=${f.rug} dup=${f.mintDup + f.walletOpen + f.maxOpen + f.cooldown} misc=${f.noPrice + f.noCash + f.noSolUsd}`);
       await sleep(SWEEP_INTERVAL_MS);
     }
   };

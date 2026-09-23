@@ -11,6 +11,8 @@ import { join } from "node:path";
 import {
   WALLET_TOXIC_MAX_EXPECTANCY,
   WALLET_TOXIC_MIN_TRADES,
+  leadBuckets,
+  type LeadBucket,
 } from "./engine";
 
 export type ClosedRow = {
@@ -97,14 +99,20 @@ export type Report = {
   totalTrades: number;
   totalWins: number;
   winRate: number;
+  /** Sum of closed[]: the true book PnL from trading. */
   totalPnlSol: number;
   expectancySol: number;
   cashSol: number;
   reservedSol: number;
+  /** Ledger counter: book PnL + legacy gap-fold + open fees of live positions. */
   realizedPnlSol: number;
+  /** realizedPnlSol - totalPnlSol: legacy/fee residue, not trading edge. */
+  ledgerGapSol: number;
   unrealizedPnlSol: number;
   equitySol: number;
   wallets: WalletStats[];
+  leadBuckets: LeadBucket[];
+  leadSamples: number;
   concentration: {
     topWalletShare: number;
     topWallet: string | null;
@@ -257,6 +265,7 @@ export function buildReport(state: Ledger): Report {
     null,
   );
 
+  const buckets = leadBuckets(trades);
   return {
     generatedAtMs: Date.now(),
     totalTrades: trades.length,
@@ -267,8 +276,11 @@ export function buildReport(state: Ledger): Report {
     cashSol: state.cashSol,
     reservedSol: state.reservedSol,
     realizedPnlSol: state.realizedPnlSol,
+    ledgerGapSol: state.realizedPnlSol - totalPnl,
     unrealizedPnlSol: state.unrealizedPnlSol,
     equitySol: state.cashSol + state.reservedSol + state.unrealizedPnlSol,
+    leadBuckets: buckets,
+    leadSamples: buckets.reduce((s, b) => s + b.n, 0),
     wallets,
     concentration: {
       topWalletShare: top?.shareOfTrades ?? 0,
@@ -307,7 +319,10 @@ export function formatReport(r: Report): string {
     `trades ${r.totalTrades} | wins ${r.totalWins} | winrate ${(r.winRate * 100).toFixed(1)}% | total ${fmtSol(r.totalPnlSol)} SOL | expectancy ${fmtSol(r.expectancySol)} SOL/trade`,
   );
   lines.push(
-    `equity ${r.equitySol.toFixed(4)} = cash ${r.cashSol.toFixed(4)} + reserved ${r.reservedSol.toFixed(4)} + unrealized ${r.unrealizedPnlSol.toFixed(4)} | realized ${fmtSol(r.realizedPnlSol)}`,
+    `equity ${r.equitySol.toFixed(4)} = cash ${r.cashSol.toFixed(4)} + reserved ${r.reservedSol.toFixed(4)} + unrealized ${r.unrealizedPnlSol.toFixed(4)}`,
+  );
+  lines.push(
+    `book ${fmtSol(r.totalPnlSol)} (closed trades) | ledger realized ${fmtSol(r.realizedPnlSol)} (Δ ${fmtSol(r.ledgerGapSol)} legacy gap + open fees — not trading edge)`,
   );
   lines.push(
     `concentration: top=${r.concentration.topWallet ? r.concentration.topWallet.slice(0, 8) : "n/a"} ${(r.concentration.topWalletShare * 100).toFixed(1)}% of trades | HHI=${r.concentration.herfindahl.toFixed(3)}`,
@@ -364,9 +379,18 @@ export function formatReport(r: Report): string {
   const leadOk = r.wallets.filter((w) => w.leadSamples > 0);
   if (leadOk.length) {
     lines.push("");
-    lines.push("lead latency (open - leader buy; negative = entered before seen buy ts):");
+    lines.push("lead latency by wallet (open - leader buy):");
     for (const w of leadOk) {
       lines.push(`  ${w.wallet.slice(0, 8)}… avg ${fmtMs(w.avgLeadMs)} over ${w.leadSamples} trades`);
+    }
+  }
+  if (r.leadSamples > 0) {
+    lines.push("");
+    lines.push("lead vs PnL (do late entries lose?):");
+    for (const b of r.leadBuckets) {
+      lines.push(
+        `  ${b.label}: n=${b.n} winrate=${(b.winRate * 100).toFixed(0)}% total=${fmtSol(b.totalPnlSol)}`,
+      );
     }
   }
   return lines.join("\n");
